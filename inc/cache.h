@@ -5,6 +5,10 @@
 
 // PAGE
 extern uint32_t PAGE_TABLE_LATENCY, SWAP_LATENCY;
+// extern bool     execution_stalled;
+// extern uint32_t partition_resume_set;
+
+// extern partition_pending;
 
 // CACHE TYPE
 #define IS_ITLB 0
@@ -70,7 +74,8 @@ extern uint32_t PAGE_TABLE_LATENCY, SWAP_LATENCY;
 #define L2C_LATENCY 10  // 4/5 (L1I or L1D) + 10 = 14/15 cycles
 
 // LAST LEVEL CACHE
-#define LLC_SET NUM_CPUS*2048
+#define LLC_SET 4096
+//#define LLC_SET NUM_CPUS*4096
 #define LLC_WAY 16
 #define LLC_RQ_SIZE NUM_CPUS*L2C_MSHR_SIZE //48
 #define LLC_WQ_SIZE NUM_CPUS*L2C_MSHR_SIZE //48
@@ -123,12 +128,11 @@ class CACHE : public MEMORY {
         block = new BLOCK* [NUM_SET];
         for (uint32_t i=0; i<NUM_SET; i++) {
             block[i] = new BLOCK[NUM_WAY]; 
-
+            
             for (uint32_t j=0; j<NUM_WAY; j++) {
-                block[i][j].lru = j;
+                    block[i][j].lru = j;
             }
         }
-
         for (uint32_t i=0; i<NUM_CPUS; i++) {
             upper_level_icache[i] = NULL;
             upper_level_dcache[i] = NULL;
@@ -193,6 +197,7 @@ class CACHE : public MEMORY {
          llc_initialize_replacement(),
          update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit),
          llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit),
+         llc_update_replacement_state_WE(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit),
          lru_update(uint32_t set, uint32_t way),
          fill_cache(uint32_t set, uint32_t way, PACKET *packet),
          replacement_final_stats(),
@@ -222,6 +227,17 @@ class CACHE : public MEMORY {
              find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type),
              llc_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type),
              lru_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type);
+    // Funciton declarations of functions related to UMON
+   void UMON(uint32_t cpu,uint64_t full_addr,uint32_t set),
+     UMON_update(uint32_t cpu, uint32_t set_index, uint32_t way),
+     make_partition(),
+     ucp_update(uint32_t set,uint32_t way,uint32_t cpu),
+     llc_commit_way_owner(uint32_t cpu, uint32_t set, uint32_t way),   // <-- new, insert here
+     enforce_partition_immediately();
+    uint32_t UMON_find_victim(uint32_t cpu, uint32_t set_index);
+    uint64_t get_utility(uint32_t cpu, uint32_t a);  
+    
+    void llc_operate_end();
 };
 
 #endif

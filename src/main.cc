@@ -4,7 +4,10 @@
 #include "ooo_cpu.h"
 #include "uncore.h"
 #include <fstream>
-
+#include "tracker.h"
+#include "cache.h"
+#include <cmath>
+extern bool partition_pending;
 uint8_t warmup_complete[NUM_CPUS], 
         simulation_complete[NUM_CPUS], 
         all_warmup_complete = 0, 
@@ -18,6 +21,14 @@ uint64_t warmup_instructions     = 1000000,
          champsim_seed;
 
 time_t start_time;
+
+//long long int write_count[LLC_WAY];
+//int current_restricted_ways[4];
+long long int total_counts[LLC_SET][LLC_WAY];
+unsigned long long int total_misses = 0;
+unsigned long long int total_writes = 0;
+//long long int total_past_all_cores_cycles = 0;
+uint64_t global_cycle_counter = 0;  // Wall-clock cycle counter, only increments after warmup
 
 // PAGE TABLE
 uint32_t PAGE_TABLE_LATENCY = 0, SWAP_LATENCY = 0;
@@ -505,6 +516,12 @@ int main(int argc, char** argv)
 	sigemptyset(&sigIntHandler.sa_mask);
 	sigIntHandler.sa_flags = 0;
 	sigaction(SIGINT, &sigIntHandler, NULL);
+	
+    for (int i=0; i<LLC_SET; i++) {
+        for(int j=0; j<LLC_WAY; j++) {
+            total_counts[i][j] = 0;
+        }
+    }
 
     cout << endl << "*** ChampSim Multicore Out-of-Order Simulator ***" << endl << endl;
 
@@ -798,9 +815,33 @@ int main(int argc, char** argv)
         elapsed_minute -= elapsed_hour*60;
         elapsed_second -= (elapsed_hour*3600 + elapsed_minute*60);
 
+        // Increment global_cycle_counter once per cycle, only after all warmup is done
+        if (all_warmup_complete > NUM_CPUS) {
+            global_cycle_counter++;
+        }
+
         for (int i=0; i<NUM_CPUS; i++) {
             // proceed one cycle
             current_core_cycle[i]++;
+            
+            // // ── PARTITION FREEZE GATE ─────────────────────────────────────
+            // // While partition enforcement is pending, skip ALL CPU operations.
+            // // No fetch, no execute, no memory ops, no LLC accesses.
+            // // llc_operate_end() (called from LLC::operate() below) will clear
+            // // partition_pending once all dirty writebacks complete.
+            // if (partition_pending) {
+            //     continue;
+            // }
+            // // ─────────────────────────────────────────────────────────────
+
+            //DEBUG print to verify UCP functionality wrt partitioning variation in every cycle
+            if (current_core_cycle[i] % 1000000 == 0) { printf("[CYCLE DEBUG] CPU %d cycle: %lu\n", i, current_core_cycle[i]); fflush(stdout); }
+
+            if (current_core_cycle[i] % 5000000 == 0) {
+                //printf("[TRACE STATUS] CPU %d at cycle %lu - Check if trace still active\n", i, current_core_cycle[i]);
+                //fflush(stdout);
+            }
+            
 
             //cout << "Trying to process instr_id: " << ooo_cpu[i].instr_unique_id << " fetch_stall: " << +ooo_cpu[i].fetch_stall;
             //cout << " stall_cycle: " << stall_cycle[i] << " current: " << current_core_cycle[i] << endl;
@@ -865,8 +906,10 @@ int main(int argc, char** argv)
             }
 
             // check for deadlock
-            if (ooo_cpu[i].ROB.entry[ooo_cpu[i].ROB.head].ip && (ooo_cpu[i].ROB.entry[ooo_cpu[i].ROB.head].event_cycle + DEADLOCK_CYCLE) <= current_core_cycle[i])
+            if ( ooo_cpu[i].ROB.entry[ooo_cpu[i].ROB.head].ip && (ooo_cpu[i].ROB.entry[ooo_cpu[i].ROB.head].event_cycle + DEADLOCK_CYCLE) <= current_core_cycle[i])
                 print_deadlock(i);
+            // else if (partition_pending)
+                // printf("[CHECK 7] CPU%d deadlock check SKIPPED -- partition pending\n", i);
 
             // check for warmup
             // warmup complete
@@ -877,6 +920,8 @@ int main(int argc, char** argv)
             if (all_warmup_complete == NUM_CPUS) { // this part is called only once when all cores are warmed up
                 all_warmup_complete++;
                 finish_warmup();
+                cout<<"Total Write Count: "<<total_writes<<endl;
+                cout<<"Total Miss Count: "<<total_misses<<endl;
             }
 
             /*
@@ -966,6 +1011,39 @@ int main(int argc, char** argv)
     print_dram_stats();
     print_branch_stats();
 #endif
+
+    cout<<"fire\n";
+    for(int i=0; i<LLC_SET; i++){
+        for(int j=0; j<LLC_WAY; j++)
+            cout<<total_counts[i][j]<<" ";
+        cout<<endl;
+    }
+
+    long long int setcount[LLC_SET];
+    long double wavg=0.0;
+    for(int i=0; i<LLC_SET; i++){
+        setcount[i]=0;
+        for(int j=0; j<LLC_WAY; j++){
+            setcount[i]+=total_counts[i][j];
+        }
+        cout<<setcount[i]<<" ";
+        wavg+=setcount[i];
+        //cout<<wavg<<endl;
+    }
+    cout<<"Total Write Count: "<<total_writes<<endl;
+    cout<<"Total Miss Count: "<<total_misses<<endl;
+    wavg=(wavg/(LLC_SET*LLC_WAY));
+
+    long double intraV=0.0,temp=0.0;
+    for(int i=0; i<LLC_SET; i++){
+        for(int j=0; j<LLC_WAY; j++){
+            temp+= pow((total_counts[i][j]-((double)setcount[i]/LLC_WAY)),2);
+        }
+        intraV+=sqrt(temp/(LLC_WAY-1));
+        temp=0;
+    }
+    intraV=(intraV/(wavg*LLC_SET));
+    cout<<"\n\nIntra-set Write Variation: "<<intraV<<endl<<endl;
 
     return 0;
 }

@@ -13,6 +13,7 @@ vector<vector<uint32_t>> PREV_WAY_OF_CPU(LLC_SET,vector<uint32_t>(NUM_CPUS,LLC_W
 FILE* output_Stats = fopen("output.txt","w");   //Opening file to print partition
 #define SIZE_OF_SETS 64
 unsigned rand_sets[SIZE_OF_SETS]; // Stores the dynamic sampled sets.
+extern uint64_t global_cycle_counter;
 // global_cycle_counter is now extern from main.cc (only increments after warmup)
 
 
