@@ -1,0 +1,658 @@
+#include "cache.h"
+#include "ooo_cpu.h"
+#include "tracker.h"
+#include <algorithm>
+
+BLOCK ATD[NUM_CPUS][LLC_SET][LLC_WAY];  // ATD for each core.
+vector<uint32_t> ways_of_cpu(NUM_CPUS); // Store the count of ways for a specific core after each partiiton. 
+uint64_t miss_counter; //Maintains the misses in the LLC.
+uint64_t hit_counter[NUM_CPUS][LLC_WAY];    //Stores hit for each core at each recency position
+uint64_t partition_interval = 5000000;    // Interval after which paritioning algorithm is run
+vector<vector<uint32_t>> PREV_WAY_OF_CPU(LLC_SET,vector<uint32_t>(NUM_CPUS,LLC_WAY/NUM_CPUS)); // Stores the current number of ways allocated to cpu in each set.
+// FILE* file_name = fopen("input.txt","r");
+FILE* output_Stats = fopen("output.txt","w");   //Opening file to print partition
+#define SIZE_OF_SETS 64
+unsigned rand_sets[SIZE_OF_SETS]; // Stores the dynamic sampled sets.
+// global_cycle_counter is now extern from main.cc (only increments after warmup)
+
+
+//Update the ATD after each miss or hit in it
+void CACHE::UMON_update(uint32_t cpu, uint32_t set_index, uint32_t way)     
+{
+    for (uint32_t i = 0; i < NUM_WAY; i++)
+    {   
+        if (ATD[cpu][set_index][i].lru < ATD[cpu][set_index][way].lru) 
+        {   
+            ATD[cpu][set_index][i].lru++; //Incrementing the recency of blocks which were recent before the current access
+        }
+    }
+    ATD[cpu][set_index][way].lru = 0; // promote to the MRU position
+}
+
+// Finds victim in ATD in case of ATD miss.
+uint32_t CACHE::UMON_find_victim(uint32_t cpu, uint32_t set_index)
+{
+    uint32_t way = 0;
+
+    // fill invalid line first
+    for (way = 0; way < NUM_WAY; way++)
+    {
+        if (ATD[cpu][set_index][way].valid == false)        // First checking invalid way int given set.
+        {   
+            ATD[cpu][set_index][way].valid=true;            // Setting it to be true.
+
+            DP(if (warmup_complete[cpu]) {
+            cout << "[" << NAME << "] " << __func__ << " instr_id: " << instr_id << " invalid set: " << set << " way: " << way;
+            cout << hex << " address: " << (full_addr>>LOG2_BLOCK_SIZE) << " victim address: " << ATD[cpu][set][way].address << " data: " << ATD[cpu][set][way].data;
+            cout << dec << " lru: " << ATD[cpu][set][way].lru << endl; });
+
+            break;
+        }
+    }
+
+    // LRU victim
+    if (way == NUM_WAY)         //No invalid block is present in the way. So least recent block is to be selected.
+    {
+        for (way = 0; way < NUM_WAY; way++)
+        {
+            if (ATD[cpu][set_index][way].lru == NUM_WAY - 1)    //Checking of least recent way in the set using lru values.
+            {
+
+                DP(if (warmup_complete[cpu]) {
+                cout << "[" << NAME << "] " << __func__ << " instr_id: " << instr_id << " replace set: " << set << " way: " << way;
+                cout << hex << " address: " << (full_addr>>LOG2_BLOCK_SIZE) << " victim address: " << block[set][way].address << " data: " << block[set][way].data;
+                cout << dec << " lru: " << ATD[cpu][set][way].lru << endl; });
+                break;
+            }
+        }
+    }
+
+    if (way == NUM_WAY)
+    {
+        cerr << "[" << NAME << "] " << __func__ << " no victim! set: " << set_index << endl;
+        assert(0);
+    }
+    // cout<< "way = "<<way <<endl;
+    return way;     // returning way of the victim in the set.
+}
+
+//Returns change in misses(utility) of cpu when its ways are increased by 1
+uint64_t CACHE::get_utility(uint32_t cpu, uint32_t a)
+{
+    return hit_counter[cpu][a];
+}
+
+//Main UMON function. It checks ATD hits
+void CACHE::UMON(uint32_t cpu, uint64_t full_addr, uint32_t set)
+{
+    int found =0;
+    for(int i=0;i<SIZE_OF_SETS;i++){
+        if(rand_sets[i]  == set) found =1;      //Checking if the set is in the sets selected for DSS
+    }
+    if(found ==0) return;
+    uint32_t set_index = set;
+    uint32_t way = 0;
+    uint64_t block_addr = full_addr >> LOG2_BLOCK_SIZE; 
+    //cout<<"cpu is "<<cpu<<" full addr is "<<full_addr<<endl;
+    for (way = 0; way < NUM_WAY; way++)
+    {
+       
+        //cout<<"Cpu is "<<cpu<<" set is "<<set_index<<" way is "<<way<<" address is "<<ATD[cpu][set_index][way].address<<endl;
+        if (ATD[cpu][set_index][way].valid and ATD[cpu][set_index][way].address == block_addr)       //Checking ATD hits
+        {
+             if (warmup_complete[cpu])
+            hit_counter[cpu][ATD[cpu][set_index][way].lru]++;
+            //cout<<"hit counter is "<<hit_counter[cpu][ATD[cpu][set_index][way].lru]<<endl;
+            break;
+        }
+    }
+    if (way == NUM_WAY)    //It means the packet is not present in the code.
+    {
+        way = UMON_find_victim(cpu, set_index); //getting way of the victim in the set
+         if (warmup_complete[cpu])
+        miss_counter++;     //Incrementing miss counter
+    }
+    ATD[cpu][set_index][way].address = block_addr;   //Adding the block to the way .
+    UMON_update(cpu, set_index, way);   //Updating its lru value
+    
+}
+
+//partitions the LLC cache using utility.
+void CACHE::make_partition()
+{
+    printf("\n================== [PARTITION PHASE START old ucp] ==================\n"); //CLEAR MARKER//
+    printf("[UCP BASE DEBUG] Starting partition - checking hit counters:\n"); //DEBUG//
+    for (uint32_t cpu = 0; cpu < NUM_CPUS; cpu++) {
+        uint64_t total_hits = 0;
+        for (uint32_t way = 0; way < LLC_WAY; way++) {
+            total_hits += hit_counter[cpu][way];
+        }
+        printf("  CPU%u total hits: %lu\n", cpu, total_hits);
+    }
+    //DEBUG//
+
+    uint32_t balance = LLC_WAY - NUM_CPUS,prev_balance; 
+    prev_balance=balance;
+    for (uint32_t i = 0; i < NUM_CPUS; i++)
+        ways_of_cpu[i] = 1;         //Giving each core 1 way initially.
+    while (balance)     // Looping till there is a way to give
+    {
+        printf("[UCP BASE DEBUG] Balance=%u, Current allocation: ", balance); //DEBUG//
+        for (uint32_t i = 0; i < NUM_CPUS; i++) {
+            printf("CPU%u=%u ", i, ways_of_cpu[i]);
+        }
+        printf("\n");
+        //DEBUG//
+        uint32_t winner = 0;        //Stores the cpu id with maximum utiliy.
+        double final_max_utility = 0;   //Maximum change in misses found
+        uint32_t req_ways=0;        //Ways required by the winner cpu for achieving maximum change in misses.
+        for (uint32_t current_cpu = 0; current_cpu < NUM_CPUS; current_cpu++)
+        {
+            double max_utility = 0;     //Store current maximum change in misses of the core
+            uint32_t current_utility=0; //Stores current change in misses of the core
+            uint32_t current_ways=0;      //Stores ways required by a cpu to acheive maximum change change misses
+            for (uint32_t i = ways_of_cpu[current_cpu]+1; i <= balance+ways_of_cpu[current_cpu]; i++)
+            {
+                current_utility += get_utility(current_cpu,i-1); //Stores change in misses as the ways allocated to the core increase 1.
+                double real_utility = 1.0 * current_utility/(i-ways_of_cpu[current_cpu]); //Stores average change in misses per way.
+                if(real_utility>max_utility)
+                {
+                    max_utility=real_utility;       //updating current maximaum change of misses of core
+                    current_ways=i;
+                }
+            }
+            if (max_utility > final_max_utility)        
+            {
+                final_max_utility = max_utility;        //updating final maximum change of misses of every core along with ways allocated to it.
+                winner = current_cpu;
+                req_ways=current_ways;
+            }
+        }
+
+        printf("[UCP BASE DEBUG] Utilities: "); //DEBUG//
+        for (uint32_t cpu = 0; cpu < NUM_CPUS; cpu++) {
+            uint64_t max_util_cpu = 0;
+            for (int k = ways_of_cpu[cpu]; k < LLC_WAY; k++) {
+                uint64_t util_val = get_utility(cpu, k);
+                if (util_val > max_util_cpu) max_util_cpu = util_val;
+            }
+            printf("CPU%u=%lu ", cpu, max_util_cpu);
+        }
+        printf("Winner=CPU%u\n", winner);
+        //DEBUG//
+
+        if(req_ways<=0) req_ways = ways_of_cpu[winner]; //Checking if there is not improvement in by allocating ways.
+        balance-=req_ways-ways_of_cpu[winner];  //Updating balance
+        ways_of_cpu[winner]=req_ways;   //updating ways of winner cpu
+        if(prev_balance==balance) break;    //breaking the loop if no ways are allocated.
+        else prev_balance = balance;        //else updating prev_balance.
+    }
+    ways_of_cpu[0]+=balance;        //giving the remaining ways to core 0 as no core has improvement with any additional ways.
+    for (uint32_t i = 0; i < NUM_CPUS; i++)
+    {
+        fprintf(output_Stats,"%u ",ways_of_cpu[i]);    //Printing partition stats.
+    }
+    fprintf(output_Stats," %lu\n",partition_interval);    //Printing parition interval.
+
+
+        //DEBUG print to verify UCP functionality wrt partitioning variation in every cycle
+    static uint64_t partition_count = 0;
+    partition_count++;
+    
+    printf("\n[UCP DEBUG] Partition #%lu completed:\n", partition_count);
+    printf("[UCP DEBUG] Ways allocation: ");
+    for (uint32_t i = 0; i < NUM_CPUS; i++) {
+        printf("CPU%u=%u ", i, ways_of_cpu[i]);
+    }
+    printf("(Total: %u)\n", LLC_WAY);
+    
+printf("[UCP DEBUG] Current partition interval: %lu cycles\n", partition_interval);
+printf("[UCP DEBUG] Global cycle counter: %lu cycles\n", global_cycle_counter);
+    
+    // Print utility summary
+    printf("[UCP DEBUG] Hit counters summary:\n");
+    for (uint32_t cpu = 0; cpu < NUM_CPUS; cpu++) {
+        uint64_t total_hits = 0;
+        for (uint32_t way = 0; way < LLC_WAY; way++) {
+            total_hits += hit_counter[cpu][way];
+        }
+        printf("  CPU%u total hits: %lu\n", cpu, total_hits);
+    }
+    printf("\n");
+    fflush(stdout);
+
+
+    
+}
+
+//Initialzing block, ATD and rand_sets
+void CACHE::llc_initialize_replacement()
+{
+    unsigned long rand_seed = 1;
+    unsigned long max_rand = 1048576;
+    uint32_t my_set = LLC_SET;
+    int do_again = 0;
+    for (int i=0; i<SIZE_OF_SETS; i++) {
+        do {
+            do_again = 0;
+            rand_seed = rand_seed * 1103515245 + 12345;
+            rand_sets[i] = ((unsigned) ((rand_seed/65536) % max_rand)) % my_set;        //Finding random sets for DSS 
+            for (int j=0; j<i; j++) {
+                if (rand_sets[i] == rand_sets[j]) {
+                    do_again = 1;
+                    break;
+                }
+            }
+        } while (do_again);
+    }
+    
+    uint32_t DIVIDER = LLC_WAY/NUM_CPUS;
+    for (uint32_t i=0; i<NUM_SET; i++) {    
+        for (uint32_t j=0; j<NUM_WAY; j++) 
+        {
+            block[i][j].lru = j%DIVIDER;    //Assiging lru for each cell
+            block[i][j].cpu = j/DIVIDER;    //Assigning cpu for each core.
+        }
+    }
+           
+    for (uint32_t i = 0; i < NUM_CPUS; i++)
+    {
+        ways_of_cpu[i] = LLC_WAY / NUM_CPUS;
+        for (uint32_t j = 0; j < LLC_SET; j++)
+        {
+            for (uint32_t k = 0; k < LLC_WAY; k++)
+            {
+                ATD[i][j][k].lru = k;       //Initializing ATD with lru
+            }
+        }
+    }
+    cout<<"Rand sets are ";
+    for(int i=0;i<SIZE_OF_SETS;i++)
+    {
+        cout<<rand_sets[i]<<" ";
+    }
+    cout<<endl;
+}
+
+// find replacement victim
+uint32_t CACHE::llc_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    uint32_t way = 0;
+
+    if(PREV_WAY_OF_CPU[set][cpu]>=ways_of_cpu[cpu])         //Denoting the core has more ways than it requires
+    {
+        // cout<<"More or equal ways than it requires\n";
+        // fill invalid line first
+        for (way = 0; way < NUM_WAY; way++)
+        {
+            if (block[set][way].valid == false && block[set][way].cpu == cpu)   //Finding an invalid block belonging to the core accessing packet
+            {
+                DP(if (warmup_complete[cpu]) {
+                cout << "[" << NAME << "] " << __func__ << " instr_id: " << instr_id << " invalid set: " << set << " way: " << way;
+                cout << hex << " address: " << (full_addr>>LOG2_BLOCK_SIZE) << " victim address: " << block[set][way].address << " data: " << block[set][way].data;
+                cout << dec << " lru: " << block[set][way].lru << endl; });
+
+                break;
+            }
+        }
+        // cout<<"Way: "<<way<<"\n";
+        // cout<<"NUM_WAY: "<<NUM_WAY<<"\n";
+
+        // LRU victim
+        if (way == NUM_WAY)
+        {
+            //---
+            int32_t temp = -1;
+            for (way = 0; way < NUM_WAY; way++)
+            {   
+                // cout<<"block[set][way].cpu: "<<block[set][way].cpu<<"\n";
+                // cout<<"cpu: "<<cpu<<"\n";
+                if (block[set][way].cpu == cpu) {
+                    if (temp == -1) temp = way;
+                    else if(block[set][way].lru > block[set][temp].lru) temp = way;
+                }
+            }
+            // cout<<"CPU No: "<<cpu<<"\n";
+            // cout<<"ways_of_cpu[cpu]: "<<ways_of_cpu[cpu]<<"\n";
+            // cout<<"temp: "<<temp<<"\n";
+            if (temp != -1)  way = temp;
+            //---
+            
+            /*for (way = 0; way < NUM_WAY; way++)
+            {
+                if (block[set][way].lru == PREV_WAY_OF_CPU[set][cpu] - 1 && block[set][way].cpu == cpu) //Finding lru victim of the core accessing the packet
+                {
+
+                    DP(if (warmup_complete[cpu]) {
+                    cout << "[" << NAME << "] " << __func__ << " instr_id: " << instr_id << " replace set: " << set << " way: " << way;
+                    cout << hex << " address: " << (full_addr>>LOG2_BLOCK_SIZE) << " victim address: " << block[set][way].address << " data: " << block[set][way].data;
+                    cout << dec << " lru: " << block[set][way].lru << endl; });
+
+                    break;
+                }
+            }*/
+        }
+    }
+    else if(PREV_WAY_OF_CPU[set][cpu]<ways_of_cpu[cpu])  //Case when the core has less ways than it should have
+    {
+        // cout<<"Core has less ways than it should have\n";
+        // fill invalid line first
+        for (way = 0; way < NUM_WAY; way++)
+        {
+            //Finding an invalid block of the existing core or any other core having more ways than it should have 
+            if (block[set][way].valid == false && (block[set][way].cpu == cpu or PREV_WAY_OF_CPU[set][block[set][way].cpu]>ways_of_cpu[block[set][way].cpu]))
+            {            
+               // PREV_WAY_OF_CPU[set][block[set][way].cpu]--;    //Updating the ways allocated to the cpu of the invalid block
+                // block[set][way].cpu=cpu;                        //Updating the cpu of the block
+              //  block[set][way].lru=PREV_WAY_OF_CPU[set][cpu];  
+               // PREV_WAY_OF_CPU[set][cpu]++;    //Upating the ways allocated of the core requesting the packet
+
+                DP(if (warmup_complete[cpu]) {
+                cout << "[" << NAME << "] " << __func__ << " instr_id: " << instr_id << " invalid set: " << set << " way: " << way;
+                cout << hex << " address: " << (full_addr>>LOG2_BLOCK_SIZE) << " victim address: " << block[set][way].address << " data: " << block[set][way].data;
+                cout << dec << " lru: " << block[set][way].lru << endl; });
+                
+                break;
+            }
+        }
+
+        // LRU victim
+        if (way == NUM_WAY)
+        {
+            //----
+            uint32_t tcpu = -1;
+            for (way = 0; way < NUM_WAY; way++) {
+                if (block[set][way].cpu != cpu && PREV_WAY_OF_CPU[set][block[set][way].cpu]>ways_of_cpu[block[set][way].cpu]) {
+                    tcpu = block[set][way].cpu;
+                    break;
+                }
+            }
+            int32_t temp = -1, llru = -1;
+            for (way = 0; way < NUM_WAY; way++)
+            {
+                if (block[set][way].cpu == tcpu) {
+                    if (temp == -1) temp = way;
+                    else if(block[set][way].lru > block[set][temp].lru) temp = way;
+                }
+                if (block[set][way].cpu == cpu) {
+                    if (llru == -1) llru = block[set][way].lru;
+                    else if(static_cast<int32_t>(block[set][way].lru) > llru) llru = block[set][way].lru;
+                }
+            }
+            if (temp != -1)  { 
+                way = temp;
+              //  PREV_WAY_OF_CPU[set][tcpu]--;
+                // // block[set][way].cpu = cpu;
+                block[set][way].lru = llru + 1;
+               // PREV_WAY_OF_CPU[set][cpu]++;
+            }
+            //----
+            
+            /*for (way = 0; way < NUM_WAY; way++)
+            {
+                //Finding lru victim of the other core which has more ways than required
+                if (block[set][way].lru == PREV_WAY_OF_CPU[set][block[set][way].cpu] - 1 && block[set][way].cpu != cpu and PREV_WAY_OF_CPU[set][block[set][way].cpu]>ways_of_cpu[block[set][way].cpu])
+                {
+                    PREV_WAY_OF_CPU[set][block[set][way].cpu]--;    //Updating the ways allocated to the cpu of the invalid block
+                    // block[set][way].cpu=cpu;                        //Updating the cpu of hte block
+                    block[set][way].lru=PREV_WAY_OF_CPU[set][cpu];  
+                    PREV_WAY_OF_CPU[set][block[set][way].cpu]++;    //Upating the ways allocated of the core requesting the packet
+
+                    DP(if (warmup_complete[cpu]) {
+                    cout << "[" << NAME << "] " << __func__ << " instr_id: " << instr_id << " replace set: " << set << " way: " << way;
+                    cout << hex << " address: " << (full_addr>>LOG2_BLOCK_SIZE) << " victim address: " << block[set][way].address << " data: " << block[set][way].data;
+                    cout << dec << " lru: " << block[set][way].lru << endl; });
+
+                    break;
+                }
+            }*/
+        }
+        
+    }
+
+    if (way == NUM_WAY)
+    {        
+        cerr << "[" << NAME << "] " << __func__ << " no victim! set: " << set << endl;
+        assert(0);
+    }
+
+    return way; //returning the way in which the packet will be inserted.
+}
+
+void CACHE::llc_commit_way_owner(uint32_t cpu, uint32_t set, uint32_t way)
+{
+    uint32_t original_owner = block[set][way].cpu;
+    if (original_owner != cpu)
+    {
+        PREV_WAY_OF_CPU[set][original_owner]--;
+        PREV_WAY_OF_CPU[set][cpu]++;
+    }
+}
+
+
+//Updating the LLC cache
+void CACHE::ucp_update(uint32_t set, uint32_t way, uint32_t cpu)
+{
+    for (uint32_t i = 0; i < NUM_WAY; i++)
+    {
+        if (block[set][i].lru < block[set][way].lru && block[set][i].cpu ==  cpu)   //Incrementing the recency of blocks which were recent before the current access for a specific core
+        {
+            block[set][i].lru++;
+        }
+    }
+    block[set][way].lru = 0; // promote to the MRU position
+}
+
+void CACHE::enforce_partition_immediately() {
+    cout<<"[UCP DEBUG] Enforcing partition immediately...\n";
+
+    for (uint32_t set = 0; set < NUM_SET; set++) {
+
+        // ── Recount actual ownership to sync PREV_WAY_OF_CPU ──────────────────
+        for (uint32_t i = 0; i < NUM_CPUS; i++) {
+            uint32_t sum_tmp = 0;
+            for (uint32_t i_way = 0; i_way < NUM_WAY; i_way++) {
+                if (block[set][i_way].cpu == i) sum_tmp++;
+            }
+            PREV_WAY_OF_CPU[set][i] = sum_tmp;
+            //printf("PREV_WAY_OF_CPU[%d][%d]: %d \n", set, i, PREV_WAY_OF_CPU[set][i]);
+        }
+        //printf("\n");
+
+        // ── Classify CPUs ──────────────────────────────────────────────────────
+        vector<uint32_t> cpus_with_less_ways;
+        vector<uint32_t> cpus_with_more_ways;
+        for (uint32_t i = 0; i < NUM_CPUS; i++) {
+            if      (PREV_WAY_OF_CPU[set][i] < ways_of_cpu[i]) cpus_with_less_ways.push_back(i);
+            else if (PREV_WAY_OF_CPU[set][i] > ways_of_cpu[i]) cpus_with_more_ways.push_back(i);
+        }
+
+        if (cpus_with_more_ways.empty()) continue;
+
+        // ── Step 1: Collect victim blocks from over-provisioned (donor) CPUs ──
+        vector<pair<uint32_t, uint32_t>> victim_candidates; // {lru_value, way_index}
+
+        for (uint32_t donor_cpu : cpus_with_more_ways) {
+            uint32_t ways_to_lose = PREV_WAY_OF_CPU[set][donor_cpu] - ways_of_cpu[donor_cpu];
+
+            // Gather all blocks owned by this donor
+            vector<pair<uint32_t, uint32_t>> donor_blocks;
+            for (uint32_t way = 0; way < NUM_WAY; way++) {
+                if (block[set][way].cpu == donor_cpu) {
+                    donor_blocks.push_back({block[set][way].lru, way});
+                }
+            }
+
+            // Sort ascending: index 0 = MRU, last index = LRU (highest lru value)
+            sort(donor_blocks.begin(), donor_blocks.end());
+
+            // Pick the 'ways_to_lose' LRU-most blocks (tail of sorted list)
+            for (uint32_t i = 0; i < ways_to_lose && i < donor_blocks.size(); i++) {
+                victim_candidates.push_back(donor_blocks[donor_blocks.size() - 1 - i]);
+            }
+        }
+
+        // Global sort: highest LRU (stalest) first
+        sort(victim_candidates.begin(), victim_candidates.end(),
+             [](const pair<uint32_t,uint32_t>& a, const pair<uint32_t,uint32_t>& b) {
+                 return a.first > b.first;
+             });
+
+        // ── Step 2: Re-assign ways from donors to receivers ───────────────────
+        // Blocks are NOT invalidated — existing data is kept as-is.
+        // Only ownership (cpu tag) and counts are updated.
+        size_t victim_idx = 0;
+        for (uint32_t receiver_cpu : cpus_with_less_ways) {
+            uint32_t ways_to_gain = ways_of_cpu[receiver_cpu] - PREV_WAY_OF_CPU[set][receiver_cpu];
+
+            for (uint32_t i = 0; i < ways_to_gain; i++) {
+                if (victim_idx >= victim_candidates.size()) {
+                    cout << "[UCP ERROR] victim_idx out of bounds for receiver CPU"
+                         << receiver_cpu << "\n";
+                    break;
+                }
+
+                uint32_t way = victim_candidates[victim_idx].second;
+                uint32_t original_owner = block[set][way].cpu;
+
+                // Only transfer ownership — valid, address, lru all untouched
+               // block[set][way].cpu = receiver_cpu;
+
+                //PREV_WAY_OF_CPU[set][original_owner]--;
+                //PREV_WAY_OF_CPU[set][receiver_cpu]++;
+
+                victim_idx++;
+            }
+        }
+
+        // ── Consistency check ──────────────────────────────────────────────────
+        for (uint32_t cpu_idx = 0; cpu_idx < NUM_CPUS; cpu_idx++) {
+            if (ways_of_cpu[cpu_idx] == 0) {
+                cout << "[UCP ERROR] CPU" << cpu_idx << " allocated 0 ways!\n";
+                exit(0);
+            }
+            //if (PREV_WAY_OF_CPU[set][cpu_idx] != ways_of_cpu[cpu_idx]) {
+            //    cout << "[UCP ERROR] Set " << set << " CPU" << cpu_idx
+            //         << " PREV=" << PREV_WAY_OF_CPU[set][cpu_idx]
+            //         << " expected=" << ways_of_cpu[cpu_idx] << "\n";
+            //    exit(0);
+            //}
+        }
+    }
+}
+
+// called on every cache hit and cache fill
+void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit)
+{
+    string TYPE_NAME;
+    if (type == LOAD)
+        TYPE_NAME = "LOAD";
+    else if (type == RFO)
+        TYPE_NAME = "RFO";
+    else if (type == PREFETCH)
+        TYPE_NAME = "PF";
+    else if (type == WRITEBACK) {
+        TYPE_NAME = "WB";
+        total_writes++;
+    } else
+        assert(0);
+
+    if (hit)
+        TYPE_NAME += "_HIT";
+    else {
+        TYPE_NAME += "_MISS";
+        total_misses++;
+    }
+
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+
+    // baseline LRU
+    if (hit && (type == WRITEBACK)) // writeback hit does not update LRU state
+        return;
+
+
+        UMON(cpu, full_addr,set);       //Calling UMON
+        // global_cycle_counter is incremented in main.cc only after warmup
+        if (global_cycle_counter >= partition_interval)
+        {
+            make_partition(); //Paritioning
+            enforce_partition_immediately(); //Enforcing partition immediately after calculation
+            partition_interval += 5000000; //Updating for next check
+            printf("================== [PARTITION PHASE END] ==================\n\n"); //CLEAR MARKER//
+            for (uint32_t i = 0; i < NUM_CPUS; i++)
+            {
+                for (uint32_t j = 0; j < LLC_WAY; j++)
+                    hit_counter[i][j] /= 2; //Updating hit counters to remember history hits in the recency posiiton
+            }
+            miss_counter=0; //Setting miss counter to 0
+        }
+
+
+    return ucp_update(set, way, cpu);   //Updating the LLC cache.
+}
+
+static long long int one=0;
+// called on every cache hit and cache fill
+void CACHE::llc_update_replacement_state_WE(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit)
+{
+    string TYPE_NAME;
+    if (type == LOAD)
+        TYPE_NAME = "LOAD";
+    else if (type == RFO)
+        TYPE_NAME = "RFO";
+    else if (type == PREFETCH)
+        TYPE_NAME = "PF";
+    else if (type == WRITEBACK) {
+        TYPE_NAME = "WB";
+        total_writes++;
+    } else
+        assert(0);
+
+    if (hit)
+        TYPE_NAME += "_HIT";
+    else {
+        TYPE_NAME += "_MISS";
+        total_misses++;
+    }
+
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+one++;
+    
+    total_counts[set][way]++;
+    // baseline LRU
+    if (hit && (type == WRITEBACK)) // writeback hit does not update LRU state
+        return;
+ 
+
+        UMON(cpu, full_addr,set);       //Calling UMON
+        // global_cycle_counter is incremented in main.cc only after warmup
+        if (global_cycle_counter >= partition_interval)
+        {
+            make_partition(); //Paritioning
+            partition_interval += 5000000; //Updating for next check
+
+            enforce_partition_immediately();
+            printf("================== [PARTITION PHASE END] ==================\n\n"); //CLEAR MARKER//
+            for (uint32_t i = 0; i < NUM_CPUS; i++)
+            {
+                for (uint32_t j = 0; j < LLC_WAY; j++)
+                    hit_counter[i][j] /= 2; //Updating hit counters to remember history hits in the recency posiiton
+            }
+            miss_counter=0; //Setting miss counter to 0
+        }
+
+
+
+    return ucp_update(set, way, cpu);   //Updating the LLC cache.
+}
+
+void CACHE::llc_replacement_final_stats()
+{
+    fclose(output_Stats);// closing file
+    //cout<<"outsi"<<one<<" "<<two<<" "<<three<<" "<<four<<" "<<five;
+}
+
+
