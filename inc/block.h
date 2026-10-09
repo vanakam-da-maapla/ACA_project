@@ -29,6 +29,8 @@ class BLOCK {
     // replacement state
     uint32_t lru;
 
+    uint32_t pf_metadata = 0; // IPCP edit
+
     BLOCK() {
         valid = 0;
         prefetch = 0;

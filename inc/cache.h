@@ -97,6 +97,14 @@ class CACHE : public MEMORY {
              pf_useless,
              pf_fill;
 
+    // IPCP edit -- start
+    // IPCP Prefetch Class Stats [NUM_CPUS][6 classes]
+    uint64_t pref_useful[NUM_CPUS][6], 
+             pref_filled[NUM_CPUS][6],
+             pref_late[NUM_CPUS][6]; 
+    
+    // IPCP edit -- end
+
     // queues
     PACKET_QUEUE WQ{NAME + "_WQ", WQ_SIZE}, // write queue
                  RQ{NAME + "_RQ", RQ_SIZE}, // read queue
@@ -133,6 +141,14 @@ class CACHE : public MEMORY {
             upper_level_icache[i] = NULL;
             upper_level_dcache[i] = NULL;
 
+            // IPCP edit -- start
+            for (uint32_t j=0; j<6; j++) {
+                pref_useful[i][j] = 0;
+                pref_filled[i][j] = 0;
+                pref_late[i][j] = 0;
+            }
+            // IPCP edit -- end
+
             for (uint32_t j=0; j<NUM_TYPES; j++) {
                 sim_access[i][j] = 0;
                 sim_hit[i][j] = 0;
@@ -140,6 +156,7 @@ class CACHE : public MEMORY {
                 roi_access[i][j] = 0;
                 roi_hit[i][j] = 0;
                 roi_miss[i][j] = 0;
+
             }
         }
 

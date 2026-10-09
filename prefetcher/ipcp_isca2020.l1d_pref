@@ -901,5 +901,14 @@ cout << "total_misses_after_warmup: " << num_misses[cpu] << endl;
 cout<<"conflicts: " << num_conflicts <<endl;
 cout << endl;
 
+//
+cout << "CPU " << cpu << " L1D IPCP Prefetcher Stats:" << endl;
+for (uint32_t c = 0; c < 6; c++) {
+    cout << "  Class " << c 
+            << " | Filled: " << pref_filled[cpu][c]
+            << " | Useful: " << pref_useful[cpu][c]
+            << " | Late: "   << pref_late[cpu][c] << endl;
+}
+
 cout << "test: " << test << endl;
 }
