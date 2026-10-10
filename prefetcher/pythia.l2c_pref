@@ -1,0 +1,129 @@
+#include "cache.h"
+#include "pythia.h"
+#include <iostream>
+#include <cstdlib>
+
+#define ALPHA 0.10f       // Learning rate
+#define GAMMA 0.90f       // Discount factor
+#define EPSILON 0.05f     // Exploration probability
+#define EVAL_QUEUE_MAX 128
+
+static std::unordered_map<PythiaState, std::vector<float>> q_table;
+static std::vector<EQEntry> eval_queue;
+static std::unordered_map<uint32_t, uint64_t> last_addr;
+
+void CACHE::l2c_prefetcher_initialize() {
+    q_table.clear();
+    eval_queue.clear();
+    last_addr.clear();
+}
+
+static std::vector<float>& get_q_values(const PythiaState& state) {
+    if (q_table.find(state) == q_table.end()) {
+        q_table[state] = std::vector<float>(NUM_ACTIONS, 0.0f);
+    }
+    return q_table[state];
+}
+
+static void update_q_value(const PythiaState& state, int action_idx, float reward, const PythiaState& next_state) {
+    auto& q_vals = get_q_values(state);
+    auto& next_q_vals = get_q_values(next_state);
+    
+    float max_next_q = next_q_vals[0];
+    for (int i = 1; i < NUM_ACTIONS; ++i) {
+        if (next_q_vals[i] > max_next_q) {
+            max_next_q = next_q_vals[i];
+        }
+    }
+    q_vals[action_idx] += ALPHA * (reward + (GAMMA * max_next_q) - q_vals[action_idx]);
+}
+
+uint32_t CACHE::l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata) {
+    // If an evicted line was prefetched and never hit by demand, deliver a negative reward (Cache Pollution)
+    if (evicted_addr != 0) {
+        uint64_t evicted_block = evicted_addr >> LOG2_BLOCK_SIZE;
+        for (auto it = eval_queue.begin(); it != eval_queue.end(); ++it) {
+            if (it->address == evicted_block && !it->hit_by_demand) {
+                update_q_value(it->state, it->action_idx, -2.0f, it->state);
+                eval_queue.erase(it);
+                break;
+            }
+        }
+    }
+    return metadata;
+}
+
+uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t hit, uint8_t type, uint32_t metadata) {
+    uint32_t cpu_id = cpu; // 'cpu' is a member variable of CACHE
+    uint64_t block_addr = addr >> LOG2_BLOCK_SIZE;
+
+    // Feature extraction: Calculate address delta
+    int64_t delta = (last_addr[cpu_id] != 0) ? (int64_t)block_addr - (int64_t)last_addr[cpu_id] : 0;
+    last_addr[cpu_id] = block_addr;
+
+    uint8_t bw_level = 0; // System DRAM bandwidth feedback indicator
+    PythiaState current_state = {ip, delta, bw_level};
+
+    // Action Selection: Epsilon-Greedy Strategy
+    int selected_action_idx = 0;
+    if ((rand() % 100) < (EPSILON * 100)) {
+        selected_action_idx = rand() % NUM_ACTIONS; // Explore
+    } else {
+        auto& q_vals = get_q_values(current_state);
+        float max_q = q_vals[0];
+        for (int i = 1; i < NUM_ACTIONS; ++i) {
+            if (q_vals[i] > max_q) {
+                max_q = q_vals[i];
+                selected_action_idx = i;
+            }
+        }
+    }
+
+    int chosen_delta = PYTHIA_ACTIONS[selected_action_idx];
+
+    if (chosen_delta != 0) {
+        uint64_t pf_block_addr = block_addr + chosen_delta;
+        uint64_t pf_full_addr = pf_block_addr << LOG2_BLOCK_SIZE;
+
+        // Verify page boundary constraint
+        if ((pf_full_addr >> LOG2_PAGE_SIZE) == (addr >> LOG2_PAGE_SIZE)) {
+            // Member method call on CACHE instance
+            prefetch_line(ip, addr, pf_full_addr, FILL_L2, 0);
+
+            // Add entry to Evaluation Queue (EQ)
+            if (eval_queue.size() >= EVAL_QUEUE_MAX) {
+                eval_queue.erase(eval_queue.begin());
+            }
+            eval_queue.push_back({pf_block_addr, current_state, selected_action_idx, 0, false});
+        }
+    }
+
+    return metadata;
+}
+
+void pythia_notify_demand_hit(uint32_t cpu, uint64_t addr) {
+    uint64_t block_addr = addr >> LOG2_BLOCK_SIZE;
+    for (auto it = eval_queue.begin(); it != eval_queue.end(); ++it) {
+        if (it->address == block_addr && !it->hit_by_demand) {
+            it->hit_by_demand = true;
+            update_q_value(it->state, it->action_idx, +1.0f, it->state); // Timely hit positive reward
+            break;
+        }
+    }
+}
+
+void pythia_notify_late_prefetch(uint32_t cpu, uint64_t addr) {
+    uint64_t block_addr = addr >> LOG2_BLOCK_SIZE;
+    for (auto it = eval_queue.begin(); it != eval_queue.end(); ++it) {
+        if (it->address == block_addr) {
+            update_q_value(it->state, it->action_idx, +0.1f, it->state); // Late prefetch small positive reward
+            break;
+        }
+    }
+}
+
+void CACHE::l2c_prefetcher_final_stats() {
+    std::cout << "\n=== PYTHIA RL PREFETCHER STATS ===" << std::endl;
+    std::cout << "Learned State Entries in Q-Table: " << q_table.size() << std::endl;
+    std::cout << "=================================\n" << std::endl;
+}
