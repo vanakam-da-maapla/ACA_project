@@ -5,6 +5,9 @@
 #include "uncore.h"
 #include <fstream>
 
+// Shared simulation-cycle counter used by UCP's periodic re-partitioning.
+uint64_t global_cycle_counter = 0;
+
 uint8_t warmup_complete[NUM_CPUS], 
         simulation_complete[NUM_CPUS], 
         all_warmup_complete = 0, 
@@ -909,6 +912,10 @@ int main(int argc, char** argv)
             if (all_simulation_complete == NUM_CPUS)
                 run_simulation = 0;
         }
+
+        // Count one simulated global cycle after warmup, independent of core count.
+        if (all_warmup_complete > NUM_CPUS)
+            global_cycle_counter++;
 
         // TODO: should it be backward?
         uncore.DRAM.operate();

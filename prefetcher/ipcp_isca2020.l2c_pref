@@ -18,6 +18,30 @@ storage for various hardware tables.
 
 
 #include "cache.h"
+#include <cstdlib>
+#include <sstream>
+#include <string>
+#include <vector>
+
+static int ipcp_degree_cap(uint32_t cpu) {
+    static const std::vector<int> caps = []() {
+        const char* list = std::getenv("IPCP_DEGREE_CAPS");
+        std::vector<int> parsed;
+        if (!list) {
+            const char* scalar = std::getenv("IPCP_DEGREE_CAP");
+            parsed.assign(NUM_CPUS, scalar ? std::atoi(scalar) : -1);
+        } else {
+            std::stringstream ss(list);
+            std::string token;
+            while (std::getline(ss, token, ',')) parsed.push_back(std::atoi(token.c_str()));
+            if (parsed.empty()) parsed.push_back(-1);
+            if (parsed.size() == 1) parsed.resize(NUM_CPUS, parsed.front());
+            if (parsed.size() < NUM_CPUS) parsed.resize(NUM_CPUS, parsed.back());
+        }
+        return parsed;
+    }();
+    return caps[cpu < caps.size() ? cpu : caps.size() - 1];
+}
 
 #define DO_PREF
 
@@ -208,6 +232,8 @@ uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache
     uint64_t line_offset = (addr >> LOG2_BLOCK_SIZE) & 0x3F;
     uint64_t line_addr = addr >> LOG2_BLOCK_SIZE;
     int prefetch_degree = 0;
+    const int degree_cap = ipcp_degree_cap(cpu);
+    if (degree_cap == 0) return metadata_in; // no-prefetch control
     int64_t stride = decode_stride(metadata_in);
     uint32_t pref_type = (metadata_in & 0xF00) >> 8;
     uint16_t ip_tag = (ip >> NUM_IP_INDEX_BITS_L2) & ((1 << NUM_IP_TAG_BITS_L2)-1);
@@ -218,6 +244,7 @@ if(NUM_CPUS == 1){
 } else {                                    // tightening the degree for multi-core
     prefetch_degree = 2;
 }
+if (degree_cap > 0 && prefetch_degree > degree_cap) prefetch_degree = degree_cap;
 
 stat_col_L2(addr, cache_hit, cpu, ip);
 if(cache_hit == 0 && type != PREFETCH)
@@ -267,6 +294,7 @@ cout << ", " << stride << "; ";
             uint32_t metadata = 0;
             if(trackers[cpu][index].pref_type == 1){
                 prefetch_degree = prefetch_degree*2;
+                if (degree_cap > 0 && prefetch_degree > degree_cap) prefetch_degree = degree_cap;
                 metadata = encode_metadata_l2(1, S_TYPE, spec_nl_l2[cpu]);                                // for stream, prefetch with twice the usual degree
             } else{
                 metadata = encode_metadata_l2(1, CS_TYPE, spec_nl_l2[cpu]);                                // for stream, prefetch with twice the usual degree

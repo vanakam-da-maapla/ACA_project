@@ -19,6 +19,42 @@ storage for various hardware tables.
 #include "ooo_cpu.h"
 #include "cache.h"
 #include <vector>
+#include <cstdlib>
+#include <sstream>
+#include <string>
+
+// Runtime experiment knob. IPCP is adaptive; this is an upper bound on its
+// native degree, not a guarantee that every request issues exactly this many lines.
+// IPCP_DEGREE_CAPS takes one comma-separated cap per core; IPCP_DEGREE_CAP is
+// retained as a scalar compatibility fallback. Zero disables all prefetching.
+static const std::vector<int>& ipcp_degree_caps() {
+    static const std::vector<int> caps = []() {
+        const char* list = std::getenv("IPCP_DEGREE_CAPS");
+        if (!list) {
+            const char* scalar = std::getenv("IPCP_DEGREE_CAP");
+            return std::vector<int>(NUM_CPUS, scalar ? std::atoi(scalar) : -1);
+        }
+        std::vector<int> parsed;
+        std::stringstream ss(list);
+        std::string token;
+        while (std::getline(ss, token, ',')) parsed.push_back(std::atoi(token.c_str()));
+        if (parsed.empty()) parsed.push_back(-1);
+        if (parsed.size() == 1) parsed.resize(NUM_CPUS, parsed.front());
+        if (parsed.size() < NUM_CPUS) parsed.resize(NUM_CPUS, parsed.back());
+        return parsed;
+    }();
+    return caps;
+}
+static int ipcp_degree_cap(uint32_t cpu) {
+    const auto& caps = ipcp_degree_caps();
+    return caps[cpu < caps.size() ? cpu : caps.size() - 1];
+}
+static int ipcp_capped_degree(int degree, uint32_t cpu) {
+    const int cap = ipcp_degree_cap(cpu);
+    return cap < 0 || degree < cap ? degree : cap;
+}
+
+
 
 /**************************************************************************************************************************
 Note that variables uint64_t pref_useful[NUM_CPUS][6], pref_filled[NUM_CPUS][6], pref_late[NUM_CPUS][6]; are to be declared 
@@ -305,7 +341,7 @@ uint64_t hash_bloom(uint64_t addr){
 }
 
 uint64_t hash_page(uint64_t addr){
-    uint64_t hash;
+    uint64_t hash = 0;
     while(addr != 0){
         hash = hash ^ addr;
         addr = addr >> 6;
@@ -393,6 +429,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         num_misses[cpu] += 1;
     num_access[cpu] += 1;
     stat_col_L1(addr, cache_hit, cpu, ip);
+    if (ipcp_degree_cap(cpu) == 0) return; // true no-prefetch control for degree zero
     // update spec nl bit when num misses crosses certain threshold
     if(num_misses[cpu] % 256 == 0 && cache_hit == 0){
         mpki[cpu] = ((num_misses[cpu]*1000.0)/(ooo_cpu[cpu].num_retired - ooo_cpu[cpu].warmup_instructions));
@@ -405,11 +442,15 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         
     }
 
-    //Updating prefetch degree based on accuracy
-    for(int i=0;i<5;i++)	
-    {       
-        if(pref_filled[cpu][i]%256 == 0)
+    // Update adaptation once per completed 256-fill window. The former
+    // `pref_filled % 256 == 0` test ran on every demand access while the
+    // counter remained on a boundary (notably at zero), repeatedly adapting.
+    static uint64_t last_degree_update[NUM_CPUS][5] = {};
+    for(int i=0;i<5;i++)
+    {
+        if(pref_filled[cpu][i] >= last_degree_update[cpu][i] + 256)
         {
+            last_degree_update[cpu][i] = (pref_filled[cpu][i] / 256) * 256;
     
             acc_useful[cpu][i]=acc_useful[cpu][i]/2.0 + (pref_useful[cpu][i] - acc_useful[cpu][i])/2.0;
             acc_filled[cpu][i]=acc_filled[cpu][i]/2.0 + (pref_filled[cpu][i] - acc_filled[cpu][i])/2.0;
@@ -617,7 +658,7 @@ cout << trackers_l1[cpu][index].last_stride << ", " << stride << ", " << tracker
                 flag = 1;
             meta_counter[cpu][0]++;
             total_count[cpu]++;
-        for (int i=0; i<prefetch_degree[cpu][1]; i++) {
+        for (int i=0; i<ipcp_capped_degree(prefetch_degree[cpu][1], cpu); i++) {
             uint64_t pf_address = 0;
 
             if(trackers_l1[cpu][index].str_dir == 1){                   // +ve stream
@@ -674,7 +715,7 @@ cout << trackers_l1[cpu][index].last_stride << ", " << stride << ", " << tracker
         else
             flag = 0;
 
-        for (int i=0; i<prefetch_degree[cpu][2]; i++) {
+        for (int i=0; i<ipcp_capped_degree(prefetch_degree[cpu][2], cpu); i++) {
             uint64_t pf_address = (line_addr + (trackers_l1[cpu][index].last_stride*(i+1))) << LOG2_BLOCK_SIZE;
 
             // Check if prefetch address is in same 4 KB page
@@ -721,7 +762,7 @@ cout << trackers_l1[cpu][index].last_stride << ", " << stride << ", " << tracker
         meta_counter[cpu][2]++;
         total_count[cpu]++;
         
-        for (i=0; i<prefetch_degree[cpu][3] + CPLX_DIST; i++) {
+        for (i=0; i<ipcp_capped_degree(prefetch_degree[cpu][3], cpu) + CPLX_DIST; i++) {
             pref_offset += CSPT_l1[cpu][signature].stride;
             uint64_t pf_address = ((line_addr + pref_offset) << LOG2_BLOCK_SIZE);
 
