@@ -1,5 +1,6 @@
 #include "cache.h"
 #include "set.h"
+#include "pythia.h" // Pythia notification interface
 
 uint64_t l2pf_access = 0;
 
@@ -199,7 +200,6 @@ void CACHE::handle_fill()
                 if (PROCESSED.occupancy < PROCESSED.SIZE)
                     PROCESSED.add_queue(&MSHR.entry[mshr_index]);
             }
-            //else if (cache_type == IS_L1D) {
             else if ((cache_type == IS_L1D) && (MSHR.entry[mshr_index].type != PREFETCH)) {
                 if (PROCESSED.occupancy < PROCESSED.SIZE)
                     PROCESSED.add_queue(&MSHR.entry[mshr_index]);
@@ -208,12 +208,6 @@ void CACHE::handle_fill()
 	    if(warmup_complete[fill_cpu] && (MSHR.entry[mshr_index].cycle_enqueued != 0))
 	      {
 		uint64_t current_miss_latency = (current_core_cycle[fill_cpu] - MSHR.entry[mshr_index].cycle_enqueued);
-		/*
-		if(cache_type == IS_L1D)
-		  {
-		    cout << current_core_cycle[fill_cpu] << " - " << MSHR.entry[mshr_index].cycle_enqueued << " = " << current_miss_latency << " MSHR index: " << mshr_index << endl;
-		  }
-		*/
 		total_miss_latency += current_miss_latency;
 	      }
 	  
@@ -332,7 +326,6 @@ void CACHE::handle_writeback()
 		      add_mshr(&WQ.entry[index]);
 		      
 		      // add it to the next level's read queue
-		      //if (lower_level) // L1D always has a lower level cache
 		      lower_level->add_rq(&WQ.entry[index]);
 		    }
                 }
@@ -360,6 +353,11 @@ void CACHE::handle_writeback()
 
                         // update request
                         if (MSHR.entry[mshr_index].type == PREFETCH) {
+                            // Pythia Late Prefetch Notification Hook
+                            if (cache_type == IS_L2C) {
+                                pythia_notify_late_prefetch(writeback_cpu, WQ.entry[index].full_addr);
+                            }
+
                             uint8_t  prior_returned = MSHR.entry[mshr_index].returned;
                             uint64_t prior_event_cycle = MSHR.entry[mshr_index].event_cycle;
 			    MSHR.entry[mshr_index] = WQ.entry[index];
@@ -556,7 +554,6 @@ void CACHE::handle_read()
                     if (PROCESSED.occupancy < PROCESSED.SIZE)
                         PROCESSED.add_queue(&RQ.entry[index]);
                 }
-                //else if (cache_type == IS_L1D) {
                 else if ((cache_type == IS_L1D) && (RQ.entry[index].type != PREFETCH)) {
                     if (PROCESSED.occupancy < PROCESSED.SIZE)
                         PROCESSED.add_queue(&RQ.entry[index]);
@@ -616,6 +613,10 @@ void CACHE::handle_read()
                 // update prefetch stats and reset prefetch bit
                 if (block[set][way].prefetch) {
                     pf_useful++;
+                    // Pythia Demand Hit Hook
+                    if (cache_type == IS_L2C) {
+                        pythia_notify_demand_hit(read_cpu, RQ.entry[index].full_addr);
+                    }
                     block[set][way].prefetch = 0;
                 }
                 block[set][way].used = 1;
@@ -672,8 +673,6 @@ void CACHE::handle_read()
                         lower_level->add_rq(&RQ.entry[index]);
 		      else { // this is the last level
                         if (cache_type == IS_STLB) {
-			  // TODO: need to differentiate page table walk and actual swap
-			  
 			  // emulate page table walk
 			  uint64_t pa = va_to_pa(read_cpu, RQ.entry[index].instr_id, RQ.entry[index].full_addr, RQ.entry[index].address, 0);
 			  
@@ -704,9 +703,7 @@ void CACHE::handle_read()
                             }
 
                             if (RQ.entry[index].load_merged) {
-                                //uint32_t lq_index = RQ.entry[index].lq_index; 
                                 MSHR.entry[mshr_index].load_merged = 1;
-                                //MSHR.entry[mshr_index].lq_index_depend_on_me[lq_index] = 1;
 				MSHR.entry[mshr_index].lq_index_depend_on_me.join (RQ.entry[index].lq_index_depend_on_me, LQ_SIZE);
                             }
                         }
@@ -761,6 +758,11 @@ void CACHE::handle_read()
 
                         // update request
                         if (MSHR.entry[mshr_index].type == PREFETCH) {
+                            // Pythia Late Prefetch Notification Hook
+                            if (cache_type == IS_L2C) {
+                                pythia_notify_late_prefetch(read_cpu, RQ.entry[index].full_addr);
+                            }
+
                             uint8_t  prior_returned = MSHR.entry[mshr_index].returned;
                             uint64_t prior_event_cycle = MSHR.entry[mshr_index].event_cycle;
                             MSHR.entry[mshr_index] = RQ.entry[index];
@@ -826,7 +828,6 @@ void CACHE::handle_read()
 void CACHE::handle_prefetch()
 {
     // handle prefetch
-
     for (uint32_t i=0; i<MAX_READ; i++) {
       
       uint32_t prefetch_cpu = PQ.entry[PQ.head].cpu;
@@ -925,7 +926,6 @@ void CACHE::handle_prefetch()
                     cout << " occupancy: " << lower_level->get_occupancy(3, PQ.entry[index].address) << " SIZE: " << lower_level->get_size(3, PQ.entry[index].address) << endl; });
 
                     // first check if the lower level PQ is full or not
-                    // this is possible since multiple prefetchers can exist at each level of caches
                     if (lower_level) {
 		      if (cache_type == IS_LLC) {
 			if (lower_level->get_occupancy(1, PQ.entry[index].address) == lower_level->get_size(1, PQ.entry[index].address))
@@ -975,8 +975,6 @@ void CACHE::handle_prefetch()
                 }
                 else {
                     if ((mshr_index == -1) && (MSHR.occupancy == MSHR_SIZE)) { // not enough MSHR resource
-
-                        // TODO: should we allow prefetching with lower fill level at this case?
                         
                         // cannot handle miss request until one of MSHRs is available
                         miss_handled = 0;
@@ -985,7 +983,6 @@ void CACHE::handle_prefetch()
                     else if (mshr_index != -1) { // already in-flight miss
 
                         // no need to update request except fill_level
-                        // update fill_level
                         if (PQ.entry[index].fill_level < MSHR.entry[mshr_index].fill_level)
                             MSHR.entry[mshr_index].fill_level = PQ.entry[index].fill_level;
 
@@ -1402,12 +1399,8 @@ int CACHE::prefetch_line(uint64_t ip, uint64_t base_addr, uint64_t pf_addr, int 
 	      }
 	    pf_packet.pf_metadata = prefetch_metadata;
             pf_packet.cpu = cpu;
-            //pf_packet.data_index = LQ.entry[lq_index].data_index;
-            //pf_packet.lq_index = lq_index;
             pf_packet.address = pf_addr >> LOG2_BLOCK_SIZE;
             pf_packet.full_addr = pf_addr;
-            //pf_packet.instr_id = LQ.entry[lq_index].instr_id;
-            //pf_packet.rob_index = LQ.entry[lq_index].rob_index;
             pf_packet.ip = ip;
             pf_packet.type = PREFETCH;
             pf_packet.event_cycle = current_core_cycle[cpu];
@@ -1438,12 +1431,8 @@ int CACHE::kpc_prefetch_line(uint64_t base_addr, uint64_t pf_addr, int pf_fill_l
               }
 	    pf_packet.pf_metadata = prefetch_metadata;
             pf_packet.cpu = cpu;
-            //pf_packet.data_index = LQ.entry[lq_index].data_index;
-            //pf_packet.lq_index = lq_index;
             pf_packet.address = pf_addr >> LOG2_BLOCK_SIZE;
             pf_packet.full_addr = pf_addr;
-            //pf_packet.instr_id = LQ.entry[lq_index].instr_id;
-            //pf_packet.rob_index = LQ.entry[lq_index].rob_index;
             pf_packet.ip = 0;
             pf_packet.type = PREFETCH;
             pf_packet.delta = delta;
@@ -1598,7 +1587,6 @@ void CACHE::return_data(PACKET *packet)
     }
 
     // MSHR holds the most updated information about this request
-    // no need to do memcpy
     MSHR.num_returned++;
     MSHR.entry[mshr_index].returned = COMPLETED;
     MSHR.entry[mshr_index].data = packet->data;
@@ -1654,32 +1642,18 @@ void CACHE::update_fill_cycle()
 int CACHE::check_mshr(PACKET *packet)
 {
     // search mshr
-  //bool instruction_and_data_collision = false;
-  
-  for (uint32_t index=0; index<MSHR_SIZE; index++)
+    for (uint32_t index=0; index<MSHR_SIZE; index++)
     {
       if (MSHR.entry[index].address == packet->address)
 	{
-	  //if(MSHR.entry[index].instruction != packet->instruction)
-	  //  {
-	  //    instruction_and_data_collision = true;
-	  //  }
-	  //else
-	  //  {
 	      DP ( if (warmup_complete[packet->cpu]) {
 		  cout << "[" << NAME << "_MSHR] " << __func__ << " same entry instr_id: " << packet->instr_id << " prior_id: " << MSHR.entry[index].instr_id;
 		  cout << " address: " << hex << packet->address;
 		  cout << " full_addr: " << packet->full_addr << dec << endl; });
 	    
 	      return index;
-	  //  }
 	}
     }
-
-    //if(instruction_and_data_collision) // remove instruction-and-data collision safeguard
-    //  {
-	//return -2;
-    //  }
 
     DP ( if (warmup_complete[packet->cpu]) {
     cout << "[" << NAME << "_MSHR] " << __func__ << " new address: " << hex << packet->address;
