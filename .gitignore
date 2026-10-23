@@ -17,3 +17,6 @@ results_10M/*
 !results_10M/.gitkeep.DS_Store
 *.bak
 test_ucp_ipcp.txt
+.DS_Store
+*.bak
+test_ucp_ipcp.txt
