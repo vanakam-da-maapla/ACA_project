@@ -14,4 +14,7 @@ obj/
 dpc3_traces/*
 !dpc3_traces/.gitkeep
 results_10M/*
-!results_10M/.gitkeep
+!results_10M/.gitkeep.DS_Store
+bin/
+obj/
+*.bak

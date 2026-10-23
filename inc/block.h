@@ -29,9 +29,7 @@ class BLOCK {
     // replacement state
     uint32_t lru;
 
-    // pthiya edit start
-    uint32_t pf_metadata = 0;
-    // pthiya edit end
+    uint32_t pf_metadata = 0; // IPCP edit
 
     BLOCK() {
         valid = 0;

@@ -197,6 +197,14 @@ class CACHE : public MEMORY {
          fill_cache(uint32_t set, uint32_t way, PACKET *packet),
          replacement_final_stats(),
          llc_replacement_final_stats(),
+         // UCP LLC replacement policy helpers (added for the UCP-only branch integration)
+         UMON_update(uint32_t cpu, uint32_t set_index, uint32_t way),
+         UMON(uint32_t cpu, uint64_t full_addr, uint32_t set),
+         make_partition(),
+         llc_commit_way_owner(uint32_t cpu, uint32_t set, uint32_t way),
+         ucp_update(uint32_t set, uint32_t way, uint32_t cpu),
+         enforce_partition_immediately(),
+         llc_update_replacement_state_WE(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit),
          //prefetcher_initialize(),
          l1d_prefetcher_initialize(),
          l2c_prefetcher_initialize(),
@@ -217,6 +225,10 @@ class CACHE : public MEMORY {
          l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in),
          llc_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in);
     
+    uint64_t get_utility(uint32_t cpu, uint32_t way_index);
+
+    uint32_t UMON_find_victim(uint32_t cpu, uint32_t set_index);
+
     uint32_t get_set(uint64_t address),
              get_way(uint64_t address, uint32_t set),
              find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type),
