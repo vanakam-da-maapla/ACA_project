@@ -18,3 +18,8 @@ results_10M/*
 bin/
 obj/
 *.bak
+
+.DS_Store
+bin/
+obj/
+*.bak
