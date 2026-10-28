@@ -51,3 +51,47 @@ void CACHE::llc_replacement_final_stats()
 {
 
 }
+
+// ============================================================
+// UCP integration compatibility hooks for LRU replacement
+// ============================================================
+
+// LRU does not partition LLC ways by CPU.
+// Therefore, no ownership update is required.
+void CACHE::llc_commit_way_owner(
+    uint32_t cpu,
+    uint32_t set,
+    uint32_t way)
+{
+    (void)cpu;
+    (void)set;
+    (void)way;
+}
+
+// This hook is called by the modified cache.cc writeback path.
+// For LRU, reuse the existing replacement-state update logic.
+void CACHE::llc_update_replacement_state_WE(
+    uint32_t cpu,
+    uint32_t set,
+    uint32_t way,
+    uint64_t full_addr,
+    uint64_t ip,
+    uint64_t victim_addr,
+    uint32_t type,
+    uint8_t hit)
+{
+    // Preserve the original LRU behavior:
+    // writeback hits should not update replacement recency.
+    if (hit && type == WRITEBACK)
+        return;
+
+    llc_update_replacement_state(
+        cpu,
+        set,
+        way,
+        full_addr,
+        ip,
+        victim_addr,
+        type,
+        hit);
+}
