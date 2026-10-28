@@ -1,17 +1,40 @@
-prefetcher/l1i_prefetcher.cc
-prefetcher/l1d_prefetcher.cc
-prefetcher/l2c_prefetcher.cc
-prefetcher/llc_prefetcher.cc
-branch/branch_predictor.cc
-replacement/llc_replacement.cc
+# Auto-created directories
+.DS_Store
+._.DS_Store
+.vscode/
 
-inc/champsim.h.bak
-
+# Executable
 bin/
 obj/
 
-# Added: large data folders — never commit these
-dpc3_traces/*
-!dpc3_traces/.gitkeep
-results_10M/*
-!results_10M/.gitkeep
+# Traces
+dpc3_traces/
+traces/
+cvp1_traces/
+
+# Run directory
+runs/
+
+# Others
+tracer/obj-intel64/
+tags
+*.out
+libbf/
+
+
+# Local dependencies
+/libbf/
+
+# Downloaded archives
+/*.zip
+
+# Build logs
+/pythia_build.log
+
+# Backup files
+*.bak
+*.orig
+*.rej
+
+# Local experimental results
+/results_10M/

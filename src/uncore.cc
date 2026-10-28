@@ -5,5 +5,5 @@ UNCORE uncore;
 
 // constructor
 UNCORE::UNCORE() {
-
+	cycle = 0;
 }

@@ -1,3 +1,4 @@
+#include <cstdint>
 #ifndef MEMORY_CLASS_H
 #define MEMORY_CLASS_H
 
@@ -17,6 +18,8 @@ extern uint32_t tRP,  // Row Precharge (RP) latency
 
 extern uint64_t l2pf_access;
 
+const char* GetAccessType(uint8_t type);
+
 class MEMORY {
   public:
     // memory interface
@@ -34,6 +37,7 @@ class MEMORY {
     virtual void increment_WQ_FULL(uint64_t address) = 0;
     virtual uint32_t get_occupancy(uint8_t queue_type, uint64_t address) = 0;
     virtual uint32_t get_size(uint8_t queue_type, uint64_t address) = 0;
+    void broadcast_bw(uint8_t bw_level){}
 
     // stats
     uint64_t ACCESS[NUM_TYPES], HIT[NUM_TYPES], MISS[NUM_TYPES], MSHR_MERGED[NUM_TYPES], STALL[NUM_TYPES];

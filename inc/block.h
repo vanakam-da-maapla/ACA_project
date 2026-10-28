@@ -1,3 +1,4 @@
+#include <cstdint>
 #ifndef BLOCK_H
 #define BLOCK_H
 
@@ -22,16 +23,11 @@ class BLOCK {
              full_addr,
              tag,
              data,
-             ip,
              cpu,
              instr_id;
 
     // replacement state
     uint32_t lru;
-
-    // pthiya edit start
-    uint32_t pf_metadata = 0;
-    // pthiya edit end
 
     BLOCK() {
         valid = 0;
@@ -69,9 +65,6 @@ class DRAM_ARRAY {
 class PACKET {
   public:
     uint8_t instruction, 
-            is_data,
-            fill_l1i,
-            fill_l1d,
             tlb_access,
             scheduled,
             translated,
@@ -121,9 +114,6 @@ class PACKET {
 
     PACKET() {
         instruction = 0;
-        is_data = 1;
-	fill_l1i = 0;
-	fill_l1d = 0;
         tlb_access = 0;
         scheduled = 0;
         translated = 0;

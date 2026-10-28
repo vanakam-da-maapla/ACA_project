@@ -1,29 +1,15 @@
+#include <cstdint>
 #ifndef INSTRUCTION_H
 #define INSTRUCTION_H
 
 
 // instruction format
-#define ROB_SIZE 352
-#define LQ_SIZE 128
-#define SQ_SIZE 72
+#define ROB_SIZE 256
+#define LQ_SIZE 72
+#define SQ_SIZE 56
 #define NUM_INSTR_DESTINATIONS_SPARC 4
 #define NUM_INSTR_DESTINATIONS 2
 #define NUM_INSTR_SOURCES 4
-
-// special registers that help us identify branches
-#define REG_STACK_POINTER 6
-#define REG_FLAGS 25
-#define REG_INSTRUCTION_POINTER 26
-
-// branch types
-#define NOT_BRANCH           0
-#define BRANCH_DIRECT_JUMP   1
-#define BRANCH_INDIRECT      2
-#define BRANCH_CONDITIONAL   3
-#define BRANCH_DIRECT_CALL   4
-#define BRANCH_INDIRECT_CALL 5
-#define BRANCH_RETURN        6
-#define BRANCH_OTHER         7
 
 #include "set.h"
 
@@ -114,7 +100,6 @@ class ooo_model_instr {
             is_memory,
             branch_taken,
             branch_mispredicted,
-            branch_prediction_made,
             translated,
             data_translated,
             source_added[NUM_INSTR_SOURCES],
@@ -126,9 +111,6 @@ class ooo_model_instr {
             mem_ready,
             asid[2],
             reg_RAW_checked[NUM_INSTR_SOURCES];
-
-    uint8_t branch_type;
-    uint64_t branch_target;
 
     uint32_t fetched, scheduled;
     int num_reg_ops, num_mem_ops, num_reg_dependent;
@@ -184,7 +166,6 @@ class ooo_model_instr {
         is_memory = 0;
         branch_taken = 0;
         branch_mispredicted = 0;
-	branch_prediction_made = 0;
         translated = 0;
         data_translated = 0;
         is_producer = 0;
@@ -197,9 +178,6 @@ class ooo_model_instr {
         mem_ready = 0;
         asid[0] = UINT8_MAX;
         asid[1] = UINT8_MAX;
-
-	branch_type = NOT_BRANCH;
-	branch_target = 0;
 
         instruction_pa = 0;
         data_pa = 0;
@@ -238,35 +216,6 @@ class ooo_model_instr {
         }
 #endif
     };
-
-  void print_instr()
-  {
-    cout << "*** " << instr_id << " ***" << endl;
-    cout << hex << "0x" << (uint64_t)ip << dec << endl;
-    cout << (uint32_t)is_branch << " " << (uint32_t)branch_taken << endl;
-    for(uint32_t i=0; i<NUM_INSTR_SOURCES; i++)
-      {
-	cout << (uint32_t)source_registers[i] << " ";
-      }
-    cout << endl;
-    for(uint32_t i=0; i<NUM_INSTR_SOURCES; i++)
-      {
-	cout << hex << "0x" << (uint32_t)source_memory[i] << dec << " ";
-      }
-    cout << endl;
-    for(uint32_t i=0; i<NUM_INSTR_DESTINATIONS; i++)
-      {
-	cout << (uint32_t)destination_registers[i] << " ";
-      }
-    cout << endl;
-    for(uint32_t i=0; i<NUM_INSTR_DESTINATIONS; i++)
-      {
-        cout << hex << "0x" << (uint32_t)destination_memory[i] << dec << " ";
-      }
-    cout << endl;
-    
-    cout << endl;
-  }
 };
 
 #endif

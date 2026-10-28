@@ -35,7 +35,7 @@
 // CPU
 #define NUM_CPUS 1
 #define CPU_FREQ 4000
-#define DRAM_IO_FREQ 3200
+#define DRAM_IO_FREQ 2400 // DDR4-2400
 #define PAGE_SIZE 4096
 #define LOG2_PAGE_SIZE 12
 
@@ -70,6 +70,7 @@
 #define DRAM_SIZE (DRAM_CHANNELS*DRAM_RANKS*DRAM_BANKS*DRAM_ROWS*DRAM_ROW_SIZE/1024) 
 #define DRAM_PAGES ((DRAM_SIZE<<10)>>2) 
 //#define DRAM_PAGES 10
+#define DRAM_BW_LEVELS 4
 
 using namespace std;
 
@@ -94,10 +95,13 @@ extern uint64_t previous_ppage, num_adjacent_page, num_cl[NUM_CPUS], allocated_p
 void print_stats();
 uint64_t rotl64 (uint64_t n, unsigned int c),
          rotr64 (uint64_t n, unsigned int c),
-  va_to_pa(uint32_t cpu, uint64_t instr_id, uint64_t va, uint64_t unique_vpage, uint8_t is_code);
+         va_to_pa(uint32_t cpu, uint64_t instr_id, uint64_t va, uint64_t unique_vpage);
 
 // log base 2 function from efectiu
 int lg2(int n);
+
+// get CPU cycle
+inline uint64_t get_cpu_cycle(uint32_t cpu) {return current_core_cycle[cpu];}
 
 // smart random number generator
 class RANDOM {

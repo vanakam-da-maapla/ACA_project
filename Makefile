@@ -8,8 +8,8 @@ inc = inc
 
 debug = 1
 
-CFlags = -Wall -O3 -std=c++11
-LDFlags =
+CFlags = -Wall -O3 -std=c++11 -D_DEFAULT_SOURCE -I./libbf/
+LDFlags = ./libbf/build/lib/libbf.a
 libs =
 libDir =
 

@@ -1,8 +1,25 @@
 #include "dram_controller.h"
 
 // initialized in main.cc
-uint32_t DRAM_MTPS, DRAM_DBUS_RETURN_TIME,
+uint32_t DRAM_MTPS, DRAM_DBUS_RETURN_TIME, DRAM_DBUS_MAX_CAS,
          tRP, tRCD, tCAS;
+
+void print_dram_config()
+{
+    cout << "dram_channel_width " << DRAM_CHANNEL_WIDTH << endl
+        << "dram_wq_size " << DRAM_WQ_SIZE << endl
+        << "dram_rq_size " << DRAM_RQ_SIZE << endl
+        << "tRP " << tRP_DRAM_NANOSECONDS << endl
+        << "tRCD " << tRCD_DRAM_NANOSECONDS << endl
+        << "tCAS " << tCAS_DRAM_NANOSECONDS << endl
+        << "dram_dbus_turn_around_time " << DRAM_DBUS_TURN_AROUND_TIME << endl
+        << "dram_write_high_wm " << DRAM_WRITE_HIGH_WM << endl
+        << "dram_write_low_wm " << DRAM_WRITE_LOW_WM << endl
+        << "min_dram_writes_per_switch " << MIN_DRAM_WRITES_PER_SWITCH << endl
+        << "dram_mtps " << DRAM_MTPS << endl
+        << "dram_dbus_return_time " << DRAM_DBUS_RETURN_TIME << endl
+        << endl;
+}
 
 void MEMORY_CONTROLLER::reset_remain_requests(PACKET_QUEUE *queue, uint32_t channel)
 {
@@ -398,10 +415,10 @@ void MEMORY_CONTROLLER::process(PACKET_QUEUE *queue)
 
             dbus_cycle_congested[op_channel] += (dbus_cycle_available[op_channel] - current_core_cycle[op_cpu]);
             bank_request[op_channel][op_rank][op_bank].cycle_available = dbus_cycle_available[op_channel];
-            dbus_congested[NUM_TYPES][NUM_TYPES]++;
-            dbus_congested[NUM_TYPES][op_type]++;
-            dbus_congested[bank_request[op_channel][op_rank][op_bank].working_type][NUM_TYPES]++;
-            dbus_congested[bank_request[op_channel][op_rank][op_bank].working_type][op_type]++;
+            dbus_congested[op_channel][NUM_TYPES][NUM_TYPES]++;
+            dbus_congested[op_channel][NUM_TYPES][op_type]++;
+            dbus_congested[op_channel][bank_request[op_channel][op_rank][op_bank].working_type][NUM_TYPES]++;
+            dbus_congested[op_channel][bank_request[op_channel][op_rank][op_bank].working_type][op_type]++;
 
             DP ( if (warmup_complete[op_cpu]) {
             cout << "[" << queue->NAME << "] " <<  __func__ << " dbus_occupied" << hex;
@@ -419,7 +436,7 @@ int MEMORY_CONTROLLER::add_rq(PACKET *packet)
     if (all_warmup_complete < NUM_CPUS) {
         if (packet->instruction) 
             upper_level_icache[packet->cpu]->return_data(packet);
-        if (packet->is_data)
+        else // data
             upper_level_dcache[packet->cpu]->return_data(packet);
 
         return -1;
@@ -436,7 +453,7 @@ int MEMORY_CONTROLLER::add_rq(PACKET *packet)
             packet->data = WQ[channel].entry[wq_index].data;
             if (packet->instruction) 
                 upper_level_icache[packet->cpu]->return_data(packet);
-            if (packet->is_data) 
+            else // data
                 upper_level_dcache[packet->cpu]->return_data(packet);
         //}
 
@@ -465,6 +482,9 @@ int MEMORY_CONTROLLER::add_rq(PACKET *packet)
             
             RQ[channel].entry[index] = *packet;
             RQ[channel].occupancy++;
+
+            /* keep a track of added entries */
+            rq_enqueue_count++;
 
 #ifdef DEBUG_PRINT
             uint32_t channel = dram_get_channel(packet->address),
