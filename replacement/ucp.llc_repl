@@ -1,0 +1,346 @@
+// UCP port for the official Pythia ChampSim base.
+// Utility monitor and greedy lookahead allocation follow UCP-only.
+// Separate way ownership is essential: BLOCK::cpu records request provenance
+// and is overwritten by CACHE::fill_cache in the official Pythia framework.
+#include "cache.h"
+#include "ooo_cpu.h"
+#include "uncore.h"
+
+#include <algorithm>
+#include <cassert>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
+extern uint8_t all_warmup_complete;
+
+namespace {
+constexpr uint32_t UCP_SAMPLED_SETS = 64;
+constexpr uint32_t UCP_NUM_SETS = (uint32_t)(NUM_CPUS * 2048);
+static_assert(UCP_NUM_SETS >= UCP_SAMPLED_SETS, "not enough LLC sets to sample");
+constexpr uint64_t UCP_DEFAULT_INTERVAL = 5000000;
+
+// Each core has a private 16-way auxiliary tag directory in the sampled LLC sets.
+// As in the UCP-only implementation, indices are actual LLC set indices.
+BLOCK atd[NUM_CPUS][LLC_SET][LLC_WAY];
+uint64_t hit_counter[NUM_CPUS][LLC_WAY] = {};
+uint32_t sampled_sets[UCP_SAMPLED_SETS] = {};
+bool sampled_mask[LLC_SET] = {};
+uint32_t quota[NUM_CPUS] = {};
+
+// A physical LLC way's partition owner is NOT the core of the cached block.
+// This metadata must remain separate from BLOCK::cpu.
+uint32_t way_owner[LLC_SET][LLC_WAY] = {};
+uint32_t owner_count[LLC_SET][NUM_CPUS] = {};
+
+uint64_t partition_interval = UCP_DEFAULT_INTERVAL;
+uint64_t next_partition_cycle = 0;
+uint64_t partition_number = 0;
+bool started_roi_schedule = false;
+
+void verify_set(uint32_t set)
+{
+    uint32_t sum = 0;
+    for (uint32_t c = 0; c < NUM_CPUS; ++c)
+        sum += owner_count[set][c];
+    assert(sum == LLC_WAY && "UCP LLC way-ownership count is inconsistent");
+}
+
+void normalize_lru(CACHE *cache, uint32_t set)
+{
+    for (uint32_t cpu = 0; cpu < NUM_CPUS; ++cpu) {
+        std::vector<uint32_t> ways;
+        for (uint32_t way = 0; way < LLC_WAY; ++way)
+            if (way_owner[set][way] == cpu)
+                ways.push_back(way);
+
+        std::sort(ways.begin(), ways.end(), [cache, set](uint32_t a, uint32_t b) {
+            if (cache->block[set][a].lru != cache->block[set][b].lru)
+                return cache->block[set][a].lru < cache->block[set][b].lru;
+            return a < b;
+        });
+        for (uint32_t rank = 0; rank < ways.size(); ++rank)
+            cache->block[set][ways[rank]].lru = rank;
+        assert(ways.size() == owner_count[set][cpu]);
+    }
+}
+
+void transfer_owner(CACHE *cache, uint32_t set, uint32_t way, uint32_t new_cpu)
+{
+    assert(set < LLC_SET && way < LLC_WAY && new_cpu < NUM_CPUS);
+    const uint32_t old_cpu = way_owner[set][way];
+    if (old_cpu == new_cpu)
+        return;
+    assert(old_cpu < NUM_CPUS && owner_count[set][old_cpu] > 0);
+    --owner_count[set][old_cpu];
+    ++owner_count[set][new_cpu];
+    way_owner[set][way] = new_cpu;
+    // The transferred line enters the new owner's LRU stack at the bottom.
+    cache->block[set][way].lru = LLC_WAY;
+    normalize_lru(cache, set);
+    verify_set(set);
+}
+
+// Rebalance a set's way ownership immediately when the global quota changes.
+// No BLOCK fields (valid/tag/data/cpu) are changed; existing lines may still
+// be read by any CPU. The next misses enforce the new way ownership.
+void rebalance_set(CACHE *cache, uint32_t set)
+{
+    for (uint32_t receiver = 0; receiver < NUM_CPUS; ++receiver) {
+        while (owner_count[set][receiver] < quota[receiver]) {
+            uint32_t victim = LLC_WAY;
+            uint32_t victim_owner = NUM_CPUS;
+            // Prefer an invalid donor way; otherwise pick the oldest donor way.
+            for (uint32_t way = 0; way < LLC_WAY; ++way) {
+                uint32_t donor = way_owner[set][way];
+                if (donor == receiver || owner_count[set][donor] <= quota[donor])
+                    continue;
+                if (victim == LLC_WAY ||
+                    (!cache->block[set][way].valid && cache->block[set][victim].valid) ||
+                    (cache->block[set][way].valid == cache->block[set][victim].valid &&
+                     cache->block[set][way].lru > cache->block[set][victim].lru)) {
+                    victim = way;
+                    victim_owner = donor;
+                }
+            }
+            assert(victim < LLC_WAY && victim_owner < NUM_CPUS);
+            transfer_owner(cache, set, victim, receiver);
+        }
+    }
+    for (uint32_t c = 0; c < NUM_CPUS; ++c)
+        assert(owner_count[set][c] == quota[c]);
+}
+
+void sample_access(uint32_t cpu, uint64_t full_addr, uint32_t set)
+{
+    if (cpu >= NUM_CPUS || !sampled_mask[set])
+        return;
+    const uint64_t address = full_addr >> LOG2_BLOCK_SIZE;
+    uint32_t way = 0;
+    for (; way < LLC_WAY; ++way)
+        if (atd[cpu][set][way].valid && atd[cpu][set][way].address == address)
+            break;
+    if (way < LLC_WAY) {
+        if (warmup_complete[cpu])
+            ++hit_counter[cpu][atd[cpu][set][way].lru];
+    } else {
+        for (way = 0; way < LLC_WAY; ++way)
+            if (!atd[cpu][set][way].valid)
+                break;
+        if (way == LLC_WAY) {
+            way = 0;
+            for (uint32_t w = 1; w < LLC_WAY; ++w)
+                if (atd[cpu][set][w].lru > atd[cpu][set][way].lru)
+                    way = w;
+        }
+        atd[cpu][set][way].valid = 1;
+    }
+    const uint32_t prev_rank = atd[cpu][set][way].lru;
+    for (uint32_t w = 0; w < LLC_WAY; ++w)
+        if (w != way && atd[cpu][set][w].valid && atd[cpu][set][w].lru < prev_rank)
+            ++atd[cpu][set][w].lru;
+    atd[cpu][set][way].address = address;
+    atd[cpu][set][way].lru = 0;
+}
+
+void allocate_ways(CACHE *cache)
+{
+    // Greedy lookahead allocator, with one guaranteed way per core.
+    // This matches the allocation structure in UCP-only, including its
+    // 64-bit utility accumulator and balanced no-benefit remainder rule.
+    uint32_t balance = LLC_WAY - NUM_CPUS;
+    for (uint32_t c = 0; c < NUM_CPUS; ++c)
+        quota[c] = 1;
+
+    while (balance) {
+        uint32_t winner = 0, requested = 0;
+        double best_global = 0;
+        for (uint32_t c = 0; c < NUM_CPUS; ++c) {
+            uint64_t total_utility = 0;
+            double best_local = 0;
+            uint32_t best_ways = 0;
+            for (uint32_t ways = quota[c] + 1; ways <= quota[c] + balance; ++ways) {
+                total_utility += hit_counter[c][ways - 1];
+                const double marginal = static_cast<double>(total_utility) / (ways - quota[c]);
+                if (marginal > best_local) {
+                    best_local = marginal;
+                    best_ways = ways;
+                }
+            }
+            if (best_local > best_global) {
+                best_global = best_local;
+                winner = c;
+                requested = best_ways;
+            }
+        }
+        if (requested <= quota[winner])
+            break;
+        balance -= requested - quota[winner];
+        quota[winner] = requested;
+    }
+    while (balance) {
+        uint32_t least = 0;
+        for (uint32_t c = 1; c < NUM_CPUS; ++c)
+            if (quota[c] < quota[least])
+                least = c;
+        ++quota[least];
+        --balance;
+    }
+    uint32_t total = 0;
+    for (uint32_t c = 0; c < NUM_CPUS; ++c)
+        total += quota[c];
+    assert(total == LLC_WAY);
+
+    for (uint32_t s = 0; s < LLC_SET; ++s)
+        rebalance_set(cache, s);
+
+    std::printf("[UCP] partition #%llu cycle=%llu quotas:",
+                static_cast<unsigned long long>(++partition_number),
+                static_cast<unsigned long long>(uncore.cycle));
+    for (uint32_t c = 0; c < NUM_CPUS; ++c)
+        std::printf(" CPU%u=%u", c, quota[c]);
+    std::printf(" total=%u\n", total);
+    for (uint32_t c = 0; c < NUM_CPUS; ++c)
+        for (uint32_t r = 0; r < LLC_WAY; ++r)
+            hit_counter[c][r] /= 2;  // preserve historical utility information
+}
+
+void maybe_partition(CACHE *cache)
+{
+    // Main uses all_warmup_complete > NUM_CPUS once every core has warmed up.
+    if (all_warmup_complete <= NUM_CPUS)
+        return;
+    if (!started_roi_schedule) {
+        started_roi_schedule = true;
+        next_partition_cycle = uncore.cycle + partition_interval;
+        std::printf("[UCP] start partition timer at cycle=%llu interval=%llu\n",
+                    static_cast<unsigned long long>(uncore.cycle),
+                    static_cast<unsigned long long>(partition_interval));
+    }
+    if (uncore.cycle >= next_partition_cycle) {
+        allocate_ways(cache);
+        do {
+            next_partition_cycle += partition_interval;
+        } while (uncore.cycle >= next_partition_cycle);
+    }
+}
+
+} // namespace
+
+void CACHE::llc_initialize_replacement(uint64_t rand_seed)
+{
+    (void)rand_seed; // UCP-only uses its own fixed seed for sampled sets.
+    static_assert(NUM_CPUS <= LLC_WAY, "UCP requires at least one LLC way per core");
+    for (uint32_t c = 0; c < NUM_CPUS; ++c)
+        quota[c] = LLC_WAY / NUM_CPUS;
+    for (uint32_t i = 0; i < LLC_WAY % NUM_CPUS; ++i)
+        ++quota[i];
+
+    for (uint32_t s = 0; s < LLC_SET; ++s) {
+        sampled_mask[s] = false;
+        for (uint32_t c = 0; c < NUM_CPUS; ++c)
+            owner_count[s][c] = 0;
+        uint32_t cpu = 0;
+        uint32_t remaining = quota[cpu];
+        for (uint32_t w = 0; w < LLC_WAY; ++w) {
+            while (remaining == 0) {
+                ++cpu;
+                remaining = quota[cpu];
+            }
+            way_owner[s][w] = cpu;
+            ++owner_count[s][cpu];
+            --remaining;
+        }
+        normalize_lru(this, s);
+        verify_set(s);
+    }
+
+    for (uint32_t c = 0; c < NUM_CPUS; ++c)
+        for (uint32_t r = 0; r < LLC_WAY; ++r)
+            hit_counter[c][r] = 0;
+    partition_interval = UCP_DEFAULT_INTERVAL;
+    next_partition_cycle = 0;
+    partition_number = 0;
+    started_roi_schedule = false;
+    unsigned long seed = 1;
+    const unsigned long max_rand = 1048576;
+    for (uint32_t i = 0; i < UCP_SAMPLED_SETS; ++i) {
+        uint32_t s;
+        bool collision;
+        do {
+            seed = seed * 1103515245 + 12345;
+            s = static_cast<uint32_t>((seed / 65536) % max_rand) % UCP_NUM_SETS;
+            collision = sampled_mask[s];
+        } while (collision);
+        sampled_sets[i] = s;
+        sampled_mask[s] = true;
+        for (uint32_t c = 0; c < NUM_CPUS; ++c)
+            for (uint32_t w = 0; w < LLC_WAY; ++w)
+                atd[c][s][w].lru = w;
+    }
+
+    if (const char *env = std::getenv("UCP_PARTITION_INTERVAL")) {
+        const unsigned long long n = std::strtoull(env, nullptr, 10);
+        if (n > 0)
+            partition_interval = static_cast<uint64_t>(n);
+    }
+    std::printf("[UCP] initialized: LLC_SET=%u LLC_WAY=%u cores=%u sampled_sets=%u interval=%llu\n",
+                LLC_SET, LLC_WAY, NUM_CPUS, UCP_SAMPLED_SETS,
+                static_cast<unsigned long long>(partition_interval));
+}
+
+uint32_t CACHE::llc_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set,
+                                const BLOCK *current_set, uint64_t ip,
+                                uint64_t full_addr, uint32_t type)
+{
+    (void)instr_id; (void)ip; (void)full_addr; (void)type;
+    assert(cpu < NUM_CPUS && set < LLC_SET);
+    // After eager quota enforcement, the requesting core owns >= 1 way.
+    // First try an invalid owned way, then evict its LRU owned way.
+    uint32_t victim = LLC_WAY;
+    for (uint32_t w = 0; w < LLC_WAY; ++w) {
+        if (way_owner[set][w] != cpu)
+            continue;
+        if (!current_set[w].valid)
+            return w;
+        if (victim == LLC_WAY || current_set[w].lru > current_set[victim].lru)
+            victim = w;
+    }
+    assert(victim < LLC_WAY);
+    return victim;
+}
+
+void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way,
+                                          uint64_t full_addr, uint64_t ip,
+                                          uint64_t victim_addr, uint32_t type,
+                                          uint8_t hit)
+{
+    (void)ip; (void)victim_addr;
+    if (way >= LLC_WAY)  // LLC bypass (if enabled)
+        return;
+    assert(set < LLC_SET && cpu < NUM_CPUS);
+    if (hit && type == WRITEBACK)
+        return;
+
+    sample_access(cpu, full_addr, set);
+    maybe_partition(this);
+
+    // LRU belongs to the physical way's partition owner.  A cross-core hit
+    // does not change way ownership.
+    const uint32_t owner = way_owner[set][way];
+    const uint32_t prev_rank = block[set][way].lru;
+    for (uint32_t w = 0; w < LLC_WAY; ++w)
+        if (w != way && way_owner[set][w] == owner && block[set][w].lru < prev_rank)
+            ++block[set][w].lru;
+    block[set][way].lru = 0;
+}
+
+void CACHE::llc_replacement_final_stats()
+{
+    std::printf("[UCP] completed partitions=%llu last quotas:",
+                static_cast<unsigned long long>(partition_number));
+    for (uint32_t c = 0; c < NUM_CPUS; ++c)
+        std::printf(" CPU%u=%u", c, quota[c]);
+    std::printf("\n");
+}
