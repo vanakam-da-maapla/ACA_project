@@ -33,33 +33,93 @@ TRACE_DIR="$ROOT_DIR/dpc3_traces"
 #    Add or remove entries here as needed.
 # ---------------------------------------------------------------------------
 TRACES=(
-  "401.bzip2-277B.champsimtrace.xz"
-  "403.gcc-16B.champsimtrace.xz"
-  "434.zeusmp-10B.champsimtrace.xz"
-  "437.leslie3d-273B.champsimtrace.xz"
-  "450.soplex-92B.champsimtrace.xz"
-  "456.hmmer-327B.champsimtrace.xz"
-  "462.libquantum-1343B.champsimtrace.xz"
-  "482.sphinx3-1522B.champsimtrace.xz"
-  "605.mcf_s-665B.champsimtrace.xz"
-  "605.mcf_s-1644B.champsimtrace.xz"
-  "619.lbm_s-3766B.champsimtrace.xz"
-  "620.omnetpp_s-874B.champsimtrace.xz"
-  "621.wrf_s-8100B.champsimtrace.xz"
-  "623.xalancbmk_s-700B.champsimtrace.xz"
-  "628.pop2_s-17B.champsimtrace.xz"
+  
+  # initial traces
+  # "401.bzip2-277B.champsimtrace.xz"
+  # "403.gcc-16B.champsimtrace.xz"
+  # "434.zeusmp-10B.champsimtrace.xz"
+  # "437.leslie3d-273B.champsimtrace.xz"
+  # "450.soplex-92B.champsimtrace.xz"
+  # "456.hmmer-327B.champsimtrace.xz"
+  # "462.libquantum-1343B.champsimtrace.xz"
+  # "482.sphinx3-1522B.champsimtrace.xz"
+  # "605.mcf_s-665B.champsimtrace.xz"
+  # "605.mcf_s-1644B.champsimtrace.xz"
+  # "619.lbm_s-3766B.champsimtrace.xz"
+  # "620.omnetpp_s-874B.champsimtrace.xz"
+  # "621.wrf_s-8100B.champsimtrace.xz"
+  # "623.xalancbmk_s-700B.champsimtrace.xz"
+  # "628.pop2_s-17B.champsimtrace.xz"
+
+  # --- Pointer-Chasing & Irregular Memory Access ---
+"429.mcf-184B.champsimtrace.xz"
+"429.mcf-192B.champsimtrace.xz"
+"473.astar-42B.champsimtrace.xz"
+"473.astar-153B.champsimtrace.xz"
+"473.astar-359B.champsimtrace.xz"
+"483.xalancbmk-736B.champsimtrace.xz"
+"605.mcf_s-1152B.champsimtrace.xz"
+"605.mcf_s-1536B.champsimtrace.xz"
+"620.omnetpp_s-141B.champsimtrace.xz"
+"623.xalancbmk_s-10B.champsimtrace.xz"
+
+# --- Regular Stride & High Memory Bandwidth (Streaming) ---
+"410.bwaves-945B.champsimtrace.xz"
+"410.bwaves-2097B.champsimtrace.xz"
+"459.GemsFDTD-765B.champsimtrace.xz"
+"459.GemsFDTD-1320B.champsimtrace.xz"
+"459.GemsFDTD-1418B.champsimtrace.xz"
+"470.lbm-1274B.champsimtrace.xz"
+"603.bwaves_s-1740B.champsimtrace.xz"
+"603.bwaves_s-2609B.champsimtrace.xz"
+"619.lbm_s-2676B.champsimtrace.xz"
+"649.fotonik3d_s-1176B.champsimtrace.xz"
+"654.roms_s-293B.champsimtrace.xz"
+
+# --- Branch-Heavy, Complex Control-Flow & Integer ---
+"400.perlbench-41B.champsimtrace.xz"
+"403.gcc-17B.champsimtrace.xz"
+"456.hmmer-191B.champsimtrace.xz"
+"464.h264ref-30B.champsimtrace.xz"
+"464.h264ref-57B.champsimtrace.xz"
+"464.h264ref-97B.champsimtrace.xz"
+"600.perlbench_s-210B.champsimtrace.xz"
+"600.perlbench_s-570B.champsimtrace.xz"
+"602.gcc_s-734B.champsimtrace.xz"
+"602.gcc_s-1850B.champsimtrace.xz"
+"602.gcc_s-2226B.champsimtrace.xz"
+"602.gcc_s-2375B.champsimtrace.xz"
+
+# --- Dense Floating Point & Scientific Computing ---
+"416.gamess-875B.champsimtrace.xz"
+"454.calculix-104B.champsimtrace.xz"
+"454.calculix-460B.champsimtrace.xz"
+"462.libquantum-714B.champsimtrace.xz"
+"465.tonto-44B.champsimtrace.xz"
+"465.tonto-1914B.champsimtrace.xz"
+"471.omnetpp-188B.champsimtrace.xz"
+"481.wrf-196B.champsimtrace.xz"
+"481.wrf-1170B.champsimtrace.xz"
+"481.wrf-1254B.champsimtrace.xz"
+"481.wrf-1281B.champsimtrace.xz"
+"482.sphinx3-234B.champsimtrace.xz"
+"482.sphinx3-1100B.champsimtrace.xz"
+"607.cactuBSSN_s-2421B.champsimtrace.xz"
+"621.wrf_s-6673B.champsimtrace.xz"
+"627.cam4_s-490B.champsimtrace.xz"
+"628.pop2_s-17B.champsimtrace.xz"
 )
 
 # ---------------------------------------------------------------------------
 # 2) SWEEP PARAMETERS (the two knobs, per the problem statement)
 # ---------------------------------------------------------------------------
-# LLC_WAYS_LIST=(1 2 4 8 16 32)
-LLC_WAYS_LIST=(4 8 16 32)
-PREFETCH_DEGREES=(1 2 4 6 8)     # 0 = prefetcher fully disabled (no.l2c_pref)
+LLC_WAYS_LIST=(1 2 4 8 16 32)
+# LLC_WAYS_LIST=(4 8 16 32)
+PREFETCH_DEGREES=(0 1 2 4 6 8)     # 0 = prefetcher fully disabled (no.l2c_pref)
 
 # Number of trace simulation jobs to run concurrently for each built binary.
 # Override via CLI environment variable, e.g.: PARALLEL_JOBS=8 bash scripts/characterize_workloads.sh
-PARALLEL_JOBS="${PARALLEL_JOBS:-15}"
+PARALLEL_JOBS="${PARALLEL_JOBS:-25}"
 
 # Warmup / detailed simulation instruction counts, in MILLIONS.
 # run_champsim.sh appends "000000" itself -- pass plain integers here.
