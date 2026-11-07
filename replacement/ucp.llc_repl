@@ -37,6 +37,7 @@ uint32_t owner_count[LLC_SET][NUM_CPUS] = {};
 uint64_t partition_interval = UCP_DEFAULT_INTERVAL;
 uint64_t next_partition_cycle = 0;
 uint64_t partition_number = 0;
+bool external_control = false;   // true: the coordination controller owns the quotas, UCP's own timer is off
 bool started_roi_schedule = false;
 
 void verify_set(uint32_t set)
@@ -208,6 +209,8 @@ void allocate_ways(CACHE *cache)
 
 void maybe_partition(CACHE *cache)
 {
+    if (external_control)
+        return;
     // Main uses all_warmup_complete > NUM_CPUS once every core has warmed up.
     if (all_warmup_complete <= NUM_CPUS)
         return;
@@ -349,4 +352,34 @@ void CACHE::llc_replacement_final_stats()
 uint32_t ucp_quota_of(uint32_t cpu)
 {
     return quota[cpu];
+}
+
+// Used by the coordination controller (src/coord.cc, weakly referenced).
+// While external control is on, UCP keeps sampling utility (UMON) but never repartitions by itself.
+void ucp_set_external_control(bool on)
+{
+    external_control = on;
+}
+
+// Install a new way allocation immediately. Returns false (and changes nothing) if it is not a valid
+// allocation: every core needs at least one way and the total must equal LLC_WAY.
+bool ucp_set_quota(const uint32_t *q)
+{
+    uint32_t total = 0;
+    for (uint32_t c = 0; c < NUM_CPUS; ++c) {
+        if (q[c] < 1)
+            return false;
+        total += q[c];
+    }
+    if (total != LLC_WAY)
+        return false;
+    for (uint32_t c = 0; c < NUM_CPUS; ++c)
+        quota[c] = q[c];
+    for (uint32_t s = 0; s < LLC_SET; ++s)
+        rebalance_set(&uncore.LLC, s);
+    std::printf("[UCP] external quota cycle=%llu quotas:", static_cast<unsigned long long>(uncore.cycle));
+    for (uint32_t c = 0; c < NUM_CPUS; ++c)
+        std::printf(" CPU%u=%u", c, quota[c]);
+    std::printf("\n");
+    return true;
 }
