@@ -1,6 +1,14 @@
 #include "cache.h"
 #include "set.h"
 
+// IPCP prefetch class (0 = none, 1 = GS, 2 = CS, 3 = CPLX, 4 = NL) carried in bits 8..11 of pf_metadata
+// (see encode_metadata() in prefetcher/ipcp_isca2020.l1d_pref and l2c_pref).  Used to index pref_useful/filled/late[cpu][6].
+static inline uint32_t ipcp_class_of(uint32_t pf_metadata)
+{
+    uint32_t c = (pf_metadata & 0xF00) >> 8;
+    return c < 6 ? c : 0;
+}
+
 uint64_t l2pf_access = 0;
 
 void CACHE::handle_fill()
@@ -144,6 +152,7 @@ void CACHE::handle_fill()
             // update replacement policy
             if (cache_type == IS_LLC) {
                 llc_update_replacement_state(fill_cpu, set, way, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].ip, block[set][way].full_addr, MSHR.entry[mshr_index].type, 0);
+                llc_commit_way_owner(fill_cpu, set, way);   // UCP: the way now belongs to the core that fills it
             }
             else
                 update_replacement_state(fill_cpu, set, way, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].ip, block[set][way].full_addr, MSHR.entry[mshr_index].type, 0);
@@ -157,7 +166,7 @@ void CACHE::handle_fill()
             /* IPCP edit start */
             // Track IPCP pref_filled
             if (MSHR.entry[mshr_index].type == PREFETCH) {
-                uint32_t pref_class = MSHR.entry[mshr_index].pf_metadata % 6;
+                uint32_t pref_class = ipcp_class_of(MSHR.entry[mshr_index].pf_metadata);
                 pref_filled[fill_cpu][pref_class]++;
             }
             /* IPCP edit end */
@@ -250,8 +259,7 @@ void CACHE::handle_writeback()
         if (way >= 0) { // writeback hit (or RFO hit for L1D)
 
             if (cache_type == IS_LLC) {
-                llc_update_replacement_state(writeback_cpu, set, way, block[set][way].full_addr, WQ.entry[index].ip, 0, WQ.entry[index].type, 1);
-
+                llc_update_replacement_state_WE(writeback_cpu, set, way, block[set][way].full_addr, WQ.entry[index].ip, 0, WQ.entry[index].type, 1);
             }
             else
                 update_replacement_state(writeback_cpu, set, way, block[set][way].full_addr, WQ.entry[index].ip, 0, WQ.entry[index].type, 1);
@@ -368,7 +376,7 @@ void CACHE::handle_writeback()
                         // update request
                         if (MSHR.entry[mshr_index].type == PREFETCH) {
                             /* IPCP edit start */
-                            uint32_t pref_class = MSHR.entry[mshr_index].pf_metadata % 6;
+                            uint32_t pref_class = ipcp_class_of(MSHR.entry[mshr_index].pf_metadata);
                             pref_late[writeback_cpu][pref_class]++;
                             /* IPCP edit end */
 
@@ -486,6 +494,7 @@ void CACHE::handle_writeback()
                     // update replacement policy
                     if (cache_type == IS_LLC) {
                         llc_update_replacement_state(writeback_cpu, set, way, WQ.entry[index].full_addr, WQ.entry[index].ip, block[set][way].full_addr, WQ.entry[index].type, 0);
+                        llc_commit_way_owner(writeback_cpu, set, way);   // UCP: owner of the way = writing-back core
                     }
                     else
                         update_replacement_state(writeback_cpu, set, way, WQ.entry[index].full_addr, WQ.entry[index].ip, block[set][way].full_addr, WQ.entry[index].type, 0);
@@ -629,7 +638,7 @@ void CACHE::handle_read()
                 if (block[set][way].prefetch) {
                     pf_useful++;
                     /* IPCP edit start */
-                    uint32_t pref_class = block[set][way].pf_metadata % 6;
+                    uint32_t pref_class = ipcp_class_of(block[set][way].pf_metadata);
                     pref_useful[read_cpu][pref_class]++;
                     /* IPCP edit end */
                     block[set][way].prefetch = 0;
@@ -778,8 +787,10 @@ void CACHE::handle_read()
                         // update request
                         if (MSHR.entry[mshr_index].type == PREFETCH) {
                             /* IPCP edit start */
-                            uint32_t pref_class = MSHR.entry[mshr_index].pf_metadata % 6;
-                            pref_late[read_cpu][pref_class]++;
+                            if (RQ.entry[index].type != PREFETCH) {      // demand merged into an in-flight prefetch = late prefetch
+                                uint32_t pref_class = ipcp_class_of(MSHR.entry[mshr_index].pf_metadata);
+                                pref_late[read_cpu][pref_class]++;
+                            }
                             /* IPCP edit end */
 
                             uint8_t  prior_returned = MSHR.entry[mshr_index].returned;
@@ -1007,7 +1018,7 @@ void CACHE::handle_prefetch()
 
                         /* IPCP edit start */
                         if (MSHR.entry[mshr_index].type != PREFETCH) {
-                            uint32_t pref_class = PQ.entry[index].pf_metadata % 6;
+                            uint32_t pref_class = ipcp_class_of(PQ.entry[index].pf_metadata);
                             pref_late[prefetch_cpu][pref_class]++;
                         }
                         /* IPCP edit end */
@@ -1159,8 +1170,11 @@ int CACHE::check_hit(PACKET *packet)
     }
 
     // hit
+    // LLC: a block only hits for the core that owns it (UCP-only semantics: partitions are per core, an LLC block
+    // brought in by another core is a miss for this core).  Other cache levels are private, so no cpu check there.
     for (uint32_t way=0; way<NUM_WAY; way++) {
-        if (block[set][way].valid && (block[set][way].tag == packet->address)) {
+        if (block[set][way].valid && (block[set][way].tag == packet->address)
+            && (cache_type != IS_LLC || block[set][way].cpu == packet->cpu)) {
 
             match_way = way;
 

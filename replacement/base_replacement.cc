@@ -98,3 +98,16 @@ void PrintStats()
 
 }
 #endif
+
+// ---------------------------------------------------------------------------------------------------------
+// Default (weak) versions of the UCP LLC hooks called from cache.cc, so that every non-UCP LLC policy
+// (lru/srrip/drrip/ship/...) still links.  replacement/ucp.llc_repl provides the real (strong) definitions.
+// ---------------------------------------------------------------------------------------------------------
+__attribute__((weak)) void CACHE::llc_commit_way_owner(uint32_t cpu, uint32_t set, uint32_t way)
+{
+}
+
+__attribute__((weak)) void CACHE::llc_update_replacement_state_WE(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit)
+{
+    llc_update_replacement_state(cpu, set, way, full_addr, ip, victim_addr, type, hit);
+}
