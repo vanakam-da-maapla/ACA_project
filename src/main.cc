@@ -4,6 +4,7 @@
 #include "ooo_cpu.h"
 #include "uncore.h"
 #include "knobs.h"
+#include "coord.h"
 #include <fstream>
 
 #define FIXED_FLOAT(x) std::fixed << std::setprecision(5) << (x)
@@ -278,6 +279,8 @@ void finish_warmup()
         ooo_cpu[i].L2C.LATENCY  = L2C_LATENCY;
     }
     uncore.LLC.LATENCY = LLC_LATENCY;
+
+    coord_arm(); // coordination controller: start the first epoch (no-op unless COORD_POLICY != off)
 }
 
 void print_deadlock(uint32_t i)
@@ -819,6 +822,8 @@ int main(int argc, char** argv)
     // simulation entry point
     generator.seed(champsim_seed);
     start_time = time(NULL);
+    coord_init();
+
     uint8_t run_simulation = 1;
     while (run_simulation) {
 
@@ -961,6 +966,7 @@ int main(int argc, char** argv)
 
         // TODO: should it be backward?
         uncore.cycle++;
+        if (coord_armed) coord_tick();
         if(knob::measure_dram_bw && uncore.cycle >= uncore.DRAM.next_bw_measure_cycle)
         {
             uint64_t this_epoch_enqueue_count = uncore.DRAM.rq_enqueue_count - uncore.DRAM.last_enqueue_count;

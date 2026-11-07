@@ -344,3 +344,9 @@ void CACHE::llc_replacement_final_stats()
         std::printf(" CPU%u=%u", c, quota[c]);
     std::printf("\n");
 }
+
+// Read-only accessor used by the coordination logger (src/coord.cc); weakly referenced there.
+uint32_t ucp_quota_of(uint32_t cpu)
+{
+    return quota[cpu];
+}
