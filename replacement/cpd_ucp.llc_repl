@@ -1,0 +1,425 @@
+// CPD-UCP: Coordinated Prefetch-Degree selection + Utility-based Cache Partitioning
+// ---------------------------------------------------------------------------------
+// Idea: UCP's UMON tells how many LLC ways a core can use.  Here every core gets
+// K shadow UMONs ("copies"), copy k emulating an L2 prefetcher running at degree
+// CPD_DEGREE[k] (0,1,2,...: incremental).  All copies see the SAME access stream
+// (the core's L2 requests) and the SAME prefetch candidates (produced by the real
+// IPCP-L2 at the maximum degree); copy k inserts only the first CPD_DEGREE[k]
+// candidates.  Each copy keeps an LRU stack per sampled set and a hit counter per
+// stack position, so after an epoch we know, for every (degree, ways) pair:
+//     misses(k, w) = accesses - hits in stack positions < w
+//     traffic(k)   = prefetches that would have been fetched from memory
+//     cost(k, w)   = misses(k, w) + lambda * traffic(k)
+// Every epoch (every core retired >= 100K instructions) the allocator runs UCP's greedy
+// lookahead over each core's lower envelope  E_c(w) = min_k cost_c(k, w),
+// then gives each core the degree that is best for the ways it received.
+// The way-ownership enforcement below is UCP's, unchanged.
+//
+// Approximations (documented):
+//  * Shadow copies are set-sampled by PAGE (hash), not by LLC set, so that a
+//    trigger and its same-page prefetch candidates land in the same sample.
+//  * The shadow is one LRU stack fed by L2 requests, i.e. it models the
+//    (private L2 + LLC partition) as one level; timeliness is not modelled.
+//  * Copies emulate degree by truncating the real prefetcher's candidate list,
+//    so prefetcher training is shared (identical) across copies.
+//
+// Knobs (environment variables, read at start):
+//  CPD_INTERVAL_INSTR  epoch length in instructions per core   (default 100000)
+//  CPD_LAMBDA          weight of prefetch memory traffic         (default 0.3)
+//  CPD_DECAY           counter decay factor per epoch                (default 0.75)
+//  CPD_HYSTERESIS      min relative gain to change a degree      (default 0.02)
+//  CPD_FIXED_DEGREE    >=0: freeze the degree (monitor only), -1 = adaptive
+//  CPD_VERBOSE         1 = print every epoch, 0 = every 100th    (default 0)
+#include "cache.h"
+#include "ooo_cpu.h"
+#include "uncore.h"
+
+#include <algorithm>
+#include <cassert>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+extern uint8_t all_warmup_complete;
+
+// ---------------- interface used by prefetcher/ipcp_L2.cc ----------------
+constexpr int CPD_MAX_DEGREE = 8;
+extern "C" void cpd_on_l2_access(uint32_t cpu, uint64_t line_addr, uint32_t type);
+extern "C" void cpd_on_candidates(uint32_t cpu, uint64_t trigger_line, const uint64_t *cand, int n);
+extern "C" int  cpd_get_degree(uint32_t cpu);
+
+namespace {
+// way-ownership state (from UCP)
+uint32_t quota[NUM_CPUS] = {};
+uint32_t way_owner[LLC_SET][LLC_WAY] = {};
+uint32_t owner_count[LLC_SET][NUM_CPUS] = {};
+
+void verify_set(uint32_t set)
+{
+    uint32_t sum = 0;
+    for (uint32_t c = 0; c < NUM_CPUS; ++c)
+        sum += owner_count[set][c];
+    assert(sum == LLC_WAY && "UCP LLC way-ownership count is inconsistent");
+}
+
+void normalize_lru(CACHE *cache, uint32_t set)
+{
+    for (uint32_t cpu = 0; cpu < NUM_CPUS; ++cpu) {
+        std::vector<uint32_t> ways;
+        for (uint32_t way = 0; way < LLC_WAY; ++way)
+            if (way_owner[set][way] == cpu)
+                ways.push_back(way);
+
+        std::sort(ways.begin(), ways.end(), [cache, set](uint32_t a, uint32_t b) {
+            if (cache->block[set][a].lru != cache->block[set][b].lru)
+                return cache->block[set][a].lru < cache->block[set][b].lru;
+            return a < b;
+        });
+        for (uint32_t rank = 0; rank < ways.size(); ++rank)
+            cache->block[set][ways[rank]].lru = rank;
+        assert(ways.size() == owner_count[set][cpu]);
+    }
+}
+
+void transfer_owner(CACHE *cache, uint32_t set, uint32_t way, uint32_t new_cpu)
+{
+    assert(set < LLC_SET && way < LLC_WAY && new_cpu < NUM_CPUS);
+    const uint32_t old_cpu = way_owner[set][way];
+    if (old_cpu == new_cpu)
+        return;
+    assert(old_cpu < NUM_CPUS && owner_count[set][old_cpu] > 0);
+    --owner_count[set][old_cpu];
+    ++owner_count[set][new_cpu];
+    way_owner[set][way] = new_cpu;
+    // The transferred line enters the new owner's LRU stack at the bottom.
+    cache->block[set][way].lru = LLC_WAY;
+    normalize_lru(cache, set);
+    verify_set(set);
+}
+
+// Rebalance a set's way ownership immediately when the global quota changes.
+// No BLOCK fields (valid/tag/data/cpu) are changed; existing lines may still
+// be read by any CPU. The next misses enforce the new way ownership.
+void rebalance_set(CACHE *cache, uint32_t set)
+{
+    for (uint32_t receiver = 0; receiver < NUM_CPUS; ++receiver) {
+        while (owner_count[set][receiver] < quota[receiver]) {
+            uint32_t victim = LLC_WAY;
+            uint32_t victim_owner = NUM_CPUS;
+            // Prefer an invalid donor way; otherwise pick the oldest donor way.
+            for (uint32_t way = 0; way < LLC_WAY; ++way) {
+                uint32_t donor = way_owner[set][way];
+                if (donor == receiver || owner_count[set][donor] <= quota[donor])
+                    continue;
+                if (victim == LLC_WAY ||
+                    (!cache->block[set][way].valid && cache->block[set][victim].valid) ||
+                    (cache->block[set][way].valid == cache->block[set][victim].valid &&
+                     cache->block[set][way].lru > cache->block[set][victim].lru)) {
+                    victim = way;
+                    victim_owner = donor;
+                }
+            }
+            assert(victim < LLC_WAY && victim_owner < NUM_CPUS);
+            transfer_owner(cache, set, victim, receiver);
+        }
+    }
+    for (uint32_t c = 0; c < NUM_CPUS; ++c)
+        assert(owner_count[set][c] == quota[c]);
+}
+
+
+// ---------------- shadow monitors ----------------
+constexpr int      CPD_K = CPD_MAX_DEGREE + 1;            // degrees 0..8
+constexpr uint32_t CPD_SAMPLE_SHIFT = 4;                  // sample 1/16 of pages
+constexpr uint32_t CPD_SETS = (LLC_SET >> CPD_SAMPLE_SHIFT) ? (LLC_SET >> CPD_SAMPLE_SHIFT) : 1;
+
+struct ShadowLine { uint64_t tag; uint8_t valid, pf, used; };
+struct ShadowSet  { ShadowLine s[LLC_WAY]; };              // s[0] = MRU
+
+ShadowSet shadow[NUM_CPUS][CPD_K][CPD_SETS];
+double hits[NUM_CPUS][CPD_K][LLC_WAY];   // demand hits by stack position
+double traffic[NUM_CPUS][CPD_K];         // prefetches that miss the shadow (memory fetches)
+double accesses[NUM_CPUS];
+uint64_t sh_pf_useful[NUM_CPUS][CPD_K], sh_pf_issued[NUM_CPUS][CPD_K];
+uint64_t cand_len_hist[NUM_CPUS][CPD_MAX_DEGREE + 1];   // diagnostics: candidate-list lengths
+
+int      degree[NUM_CPUS];
+uint64_t degree_epochs[NUM_CPUS][CPD_K];
+uint64_t quota_epochs[NUM_CPUS][LLC_WAY + 1];
+
+uint64_t interval_instr = 100000;
+double   lambda_traffic = 0.3, cpd_decay = 0.75, hysteresis = 0.02;
+int      fixed_degree = -1, verbose = 0;
+uint64_t epochs = 0;
+bool     active = false;
+
+inline bool sampled_page(uint64_t line)
+{
+    uint64_t page = line >> (LOG2_PAGE_SIZE - LOG2_BLOCK_SIZE);
+    uint64_t h = page * 0x9E3779B97F4A7C15ULL;
+    return (h >> (64 - CPD_SAMPLE_SHIFT)) == 0;
+}
+inline uint32_t shadow_index(uint64_t line) { return (uint32_t)(line % CPD_SETS); }
+
+// returns stack position of tag or -1
+inline int find(const ShadowSet &st, uint64_t tag)
+{
+    for (int p = 0; p < (int)LLC_WAY; ++p)
+        if (st.s[p].valid && st.s[p].tag == tag) return p;
+    return -1;
+}
+inline void move_to_front(ShadowSet &st, int p)
+{
+    ShadowLine l = st.s[p];
+    for (int i = p; i > 0; --i) st.s[i] = st.s[i - 1];
+    st.s[0] = l;
+}
+inline void insert_front(ShadowSet &st, uint64_t tag, bool pf)
+{
+    for (int i = LLC_WAY - 1; i > 0; --i) st.s[i] = st.s[i - 1];
+    st.s[0].tag = tag; st.s[0].valid = 1; st.s[0].pf = pf; st.s[0].used = 0;
+}
+
+inline bool measuring(uint32_t cpu) { return cpu < NUM_CPUS && warmup_complete[cpu]; }
+
+uint64_t total_retired()
+{
+    uint64_t t = 0;
+    for (uint32_t c = 0; c < NUM_CPUS; ++c) t += ooo_cpu[c].num_retired;
+    return t;
+}
+
+double cost(uint32_t c, int k, uint32_t w)   // w = ways (1..LLC_WAY)
+{
+    double h = 0;
+    for (uint32_t p = 0; p < w; ++p) h += hits[c][k][p];
+    return (accesses[c] - h) + lambda_traffic * traffic[c][k];
+}
+
+int best_degree(uint32_t c, uint32_t w)
+{
+    if (fixed_degree >= 0) return fixed_degree;
+    int best = degree[c];
+    double best_cost = cost(c, degree[c], w);
+    for (int k = 0; k < CPD_K; ++k) {
+        double ck = cost(c, k, w);
+        if (ck < best_cost * (1.0 - hysteresis)) { best_cost = ck; best = k; }
+    }
+    return best;
+}
+
+void allocate(CACHE *cache)
+{
+    // lower envelope per core
+    double env[NUM_CPUS][LLC_WAY + 1];
+    for (uint32_t c = 0; c < NUM_CPUS; ++c)
+        for (uint32_t w = 1; w <= LLC_WAY; ++w) {
+            double m = 1e300;
+            if (fixed_degree >= 0) m = cost(c, fixed_degree, w);
+            else for (int k = 0; k < CPD_K; ++k) m = std::min(m, cost(c, k, w));
+            env[c][w] = m;
+        }
+
+    // UCP greedy lookahead on the envelope (one guaranteed way per core)
+    uint32_t balance = LLC_WAY - NUM_CPUS;
+    for (uint32_t c = 0; c < NUM_CPUS; ++c) quota[c] = 1;
+    while (balance) {
+        uint32_t winner = 0, requested = 0;
+        double best_global = 0;
+        for (uint32_t c = 0; c < NUM_CPUS; ++c) {
+            double best_local = 0; uint32_t best_ways = 0;
+            for (uint32_t w = quota[c] + 1; w <= quota[c] + balance; ++w) {
+                double mu = (env[c][quota[c]] - env[c][w]) / (double)(w - quota[c]);
+                if (mu > best_local) { best_local = mu; best_ways = w; }
+            }
+            if (best_local > best_global) { best_global = best_local; winner = c; requested = best_ways; }
+        }
+        if (requested <= quota[winner]) break;
+        balance -= requested - quota[winner];
+        quota[winner] = requested;
+    }
+    while (balance) {                       // no one benefits: spread the rest evenly
+        uint32_t least = 0;
+        for (uint32_t c = 1; c < NUM_CPUS; ++c) if (quota[c] < quota[least]) least = c;
+        ++quota[least]; --balance;
+    }
+    uint32_t total = 0;
+    for (uint32_t c = 0; c < NUM_CPUS; ++c) total += quota[c];
+    assert(total == LLC_WAY);
+
+    for (uint32_t c = 0; c < NUM_CPUS; ++c) {
+        degree[c] = best_degree(c, quota[c]);
+        ++degree_epochs[c][degree[c]];
+        ++quota_epochs[c][quota[c]];
+    }
+    for (uint32_t s = 0; s < LLC_SET; ++s) rebalance_set(cache, s);
+
+    ++epochs;
+    if (verbose || epochs % 100 == 1) {
+        std::printf("[CPD] epoch %llu instr=%llu", (unsigned long long)epochs, (unsigned long long)total_retired());
+        for (uint32_t c = 0; c < NUM_CPUS; ++c) std::printf(" | C%u ways=%u deg=%d", c, quota[c], degree[c]);
+        std::printf("\n");
+    }
+    // decay (keeps history, adapts to phases)
+    for (uint32_t c = 0; c < NUM_CPUS; ++c) {
+        accesses[c] *= cpd_decay;
+        for (int k = 0; k < CPD_K; ++k) {
+            traffic[c][k] *= cpd_decay;
+            for (uint32_t p = 0; p < LLC_WAY; ++p) hits[c][k][p] *= cpd_decay;
+        }
+    }
+}
+
+uint64_t epoch_start[NUM_CPUS];
+
+// An epoch ends when EVERY core has retired interval_instr instructions since the
+// last decision (so slow, memory-bound cores also collect enough samples).
+void maybe_epoch(CACHE *cache)
+{
+    if (all_warmup_complete <= NUM_CPUS) return;
+    if (!active) {
+        active = true;
+        for (uint32_t c = 0; c < NUM_CPUS; ++c) epoch_start[c] = ooo_cpu[c].num_retired;
+        std::printf("[CPD] start: interval=%llu instr/core (all cores) lambda=%.3f decay=%.2f hysteresis=%.3f degrees=0..%d fixed=%d shadow_sets=%u sample=1/%u\n",
+                    (unsigned long long)interval_instr, lambda_traffic, cpd_decay, hysteresis, CPD_MAX_DEGREE,
+                    fixed_degree, CPD_SETS, 1u << CPD_SAMPLE_SHIFT);
+        return;
+    }
+    for (uint32_t c = 0; c < NUM_CPUS; ++c)
+        if (ooo_cpu[c].num_retired - epoch_start[c] < interval_instr) return;
+    allocate(cache);
+    for (uint32_t c = 0; c < NUM_CPUS; ++c) epoch_start[c] = ooo_cpu[c].num_retired;
+}
+} // namespace
+
+// ---------------- hooks called from the L2 prefetcher ----------------
+extern "C" void cpd_on_l2_access(uint32_t cpu, uint64_t line, uint32_t type)
+{
+    if (type == WRITEBACK || !measuring(cpu) || !sampled_page(line)) return;
+    accesses[cpu] += 1;
+    const uint32_t idx = shadow_index(line);
+    for (int k = 0; k < CPD_K; ++k) {
+        ShadowSet &st = shadow[cpu][k][idx];
+        int p = find(st, line);
+        if (p >= 0) {
+            hits[cpu][k][p] += 1;
+            if (st.s[p].pf && !st.s[p].used) { st.s[p].used = 1; ++sh_pf_useful[cpu][k]; }
+            move_to_front(st, p);
+        } else {
+            insert_front(st, line, false);
+        }
+    }
+}
+
+extern "C" void cpd_on_candidates(uint32_t cpu, uint64_t trigger_line, const uint64_t *cand, int n)
+{
+    if (!measuring(cpu)) return;
+    ++cand_len_hist[cpu][std::min(n, CPD_MAX_DEGREE)];
+    if (!sampled_page(trigger_line)) return;
+    for (int k = 1; k < CPD_K; ++k) {                // copy k uses the first k candidates
+        const int lim = std::min(n, k);
+        for (int i = 0; i < lim; ++i) {
+            const uint64_t line = cand[i];
+            if (!sampled_page(line)) continue;       // same page as trigger in practice
+            ShadowSet &st = shadow[cpu][k][shadow_index(line)];
+            if (find(st, line) >= 0) continue;       // already cached: no traffic, no promotion
+            traffic[cpu][k] += 1;
+            ++sh_pf_issued[cpu][k];
+            insert_front(st, line, true);
+        }
+    }
+}
+
+extern "C" int cpd_get_degree(uint32_t cpu)
+{
+    if (cpu >= NUM_CPUS) return 2;
+    return degree[cpu];
+}
+
+// ---------------- ChampSim LLC replacement interface ----------------
+void CACHE::llc_initialize_replacement(uint64_t rand_seed)
+{
+    (void)rand_seed;
+    static_assert(NUM_CPUS <= LLC_WAY, "CPD-UCP requires at least one LLC way per core");
+    for (uint32_t c = 0; c < NUM_CPUS; ++c) quota[c] = LLC_WAY / NUM_CPUS;
+    for (uint32_t i = 0; i < LLC_WAY % NUM_CPUS; ++i) ++quota[i];
+    for (uint32_t s = 0; s < LLC_SET; ++s) {
+        for (uint32_t c = 0; c < NUM_CPUS; ++c) owner_count[s][c] = 0;
+        uint32_t cpu = 0, remaining = quota[cpu];
+        for (uint32_t w = 0; w < LLC_WAY; ++w) {
+            while (remaining == 0) { ++cpu; remaining = quota[cpu]; }
+            way_owner[s][w] = cpu; ++owner_count[s][cpu]; --remaining;
+        }
+        normalize_lru(this, s);
+        verify_set(s);
+    }
+    std::memset(shadow, 0, sizeof(shadow));
+    std::memset(hits, 0, sizeof(hits));
+    std::memset(traffic, 0, sizeof(traffic));
+    std::memset(accesses, 0, sizeof(accesses));
+    auto envd = [](const char *n, double d) { const char *e = std::getenv(n); return e ? std::atof(e) : d; };
+    interval_instr = (uint64_t)envd("CPD_INTERVAL_INSTR", 100000);
+    lambda_traffic = envd("CPD_LAMBDA", 0.3);
+    cpd_decay          = envd("CPD_DECAY", 0.75);
+    hysteresis     = envd("CPD_HYSTERESIS", 0.02);
+    fixed_degree   = (int)envd("CPD_FIXED_DEGREE", -1);
+    verbose        = (int)envd("CPD_VERBOSE", 0);
+    if (fixed_degree > CPD_MAX_DEGREE) fixed_degree = CPD_MAX_DEGREE;
+    for (uint32_t c = 0; c < NUM_CPUS; ++c) degree[c] = fixed_degree >= 0 ? fixed_degree : 2;  // IPCP multi-core default
+    std::printf("[CPD] initialized: LLC_SET=%u LLC_WAY=%u cores=%u (UCP way ownership + %d shadow UMONs per core)\n",
+                LLC_SET, LLC_WAY, NUM_CPUS, CPD_K);
+}
+
+uint32_t CACHE::llc_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set,
+                                const BLOCK *current_set, uint64_t ip,
+                                uint64_t full_addr, uint32_t type)
+{
+    (void)instr_id; (void)ip; (void)full_addr; (void)type;
+    assert(cpu < NUM_CPUS && set < LLC_SET);
+    uint32_t victim = LLC_WAY;
+    for (uint32_t w = 0; w < LLC_WAY; ++w) {
+        if (way_owner[set][w] != cpu) continue;
+        if (!current_set[w].valid) return w;
+        if (victim == LLC_WAY || current_set[w].lru > current_set[victim].lru) victim = w;
+    }
+    assert(victim < LLC_WAY);
+    return victim;
+}
+
+void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way,
+                                          uint64_t full_addr, uint64_t ip,
+                                          uint64_t victim_addr, uint32_t type,
+                                          uint8_t hit)
+{
+    (void)ip; (void)victim_addr; (void)full_addr;
+    if (way >= LLC_WAY) return;
+    assert(set < LLC_SET && cpu < NUM_CPUS);
+    if (hit && type == WRITEBACK) return;
+    maybe_epoch(this);
+    const uint32_t owner = way_owner[set][way];
+    const uint32_t prev_rank = block[set][way].lru;
+    for (uint32_t w = 0; w < LLC_WAY; ++w)
+        if (w != way && way_owner[set][w] == owner && block[set][w].lru < prev_rank)
+            ++block[set][w].lru;
+    block[set][way].lru = 0;
+}
+
+void CACHE::llc_replacement_final_stats()
+{
+    std::printf("[CPD] completed epochs=%llu\n", (unsigned long long)epochs);
+    for (uint32_t c = 0; c < NUM_CPUS; ++c) {
+        std::printf("[CPD] C%u final ways=%u degree=%d | degree histogram:", c, quota[c], degree[c]);
+        for (int k = 0; k < CPD_K; ++k) std::printf(" d%d=%llu", k, (unsigned long long)degree_epochs[c][k]);
+        std::printf(" | ways histogram:");
+        for (uint32_t w = 1; w <= LLC_WAY; ++w)
+            if (quota_epochs[c][w]) std::printf(" %u:%llu", w, (unsigned long long)quota_epochs[c][w]);
+        std::printf(" | cand-list length:");
+        for (int n = 1; n <= CPD_MAX_DEGREE; ++n) std::printf(" %d:%llu", n, (unsigned long long)cand_len_hist[c][n]);
+        std::printf(" | shadow pf accuracy (d2,d4,d8):");
+        for (int k : {2, 4, 8})
+            std::printf(" %.2f", sh_pf_issued[c][k] ? (double)sh_pf_useful[c][k] / sh_pf_issued[c][k] : 0.0);
+        std::printf("\n");
+    }
+}

@@ -206,7 +206,8 @@ void IPCP_L1::invoke_prefetcher(uint64_t ip, uint64_t addr, uint8_t cache_hit, u
        // issue a next line prefetch upon encountering new IP
            uint64_t pf_address = ((addr>>LOG2_BLOCK_SIZE)+1) << LOG2_BLOCK_SIZE; // BASE NL=1, changing it to 3
            metadata = encode_metadata(1, NL_TYPE, spec_nl[cpu]);
-           m_parent_cache->prefetch_line(ip, addr, pf_address, FILL_L1, metadata);
+           if ((pf_address >> LOG2_PAGE_SIZE) == (addr >> LOG2_PAGE_SIZE))   // [fix] same-page check that DPC-3 prefetch_line() had
+               m_parent_cache->prefetch_line(ip, addr, pf_address, FILL_L1, metadata);
            return;
        }
        else {                                                     // if same IP encountered, set valid bit
@@ -332,7 +333,8 @@ void IPCP_L1::invoke_prefetcher(uint64_t ip, uint64_t addr, uint8_t cache_hit, u
    if(num_prefs == 0 && spec_nl[cpu] == 1){                                        // NL IP
        uint64_t pf_address = ((addr>>LOG2_BLOCK_SIZE)+1) << LOG2_BLOCK_SIZE;
        metadata = encode_metadata(1, NL_TYPE, spec_nl[cpu]);
-       m_parent_cache->prefetch_line(ip, addr, pf_address, FILL_L1, metadata);
+       if ((pf_address >> LOG2_PAGE_SIZE) == (addr >> LOG2_PAGE_SIZE))   // [fix] same-page check that DPC-3 prefetch_line() had
+           m_parent_cache->prefetch_line(ip, addr, pf_address, FILL_L1, metadata);
        SIG_DP(cout << "1, ");
    }
 
