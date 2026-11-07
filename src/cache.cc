@@ -238,6 +238,13 @@ void CACHE::handle_fill()
 
             fill_cache(set, way, &MSHR.entry[mshr_index]);
 
+            /* IPCP edit start */
+            if (MSHR.entry[mshr_index].type == PREFETCH) {
+                uint32_t pref_class = MSHR.entry[mshr_index].pf_metadata % 6;
+                pref_filled[fill_cpu][pref_class]++;
+            }
+            /* IPCP edit end */
+
             // RFO marks cache line dirty
             if (cache_type == IS_L1D)
             {
@@ -414,6 +421,11 @@ void CACHE::handle_writeback()
 
                         // update request
                         if (MSHR.entry[mshr_index].type == PREFETCH) {
+                            /* IPCP edit start */
+                            uint32_t pref_class = MSHR.entry[mshr_index].pf_metadata % 6;
+                            pref_late[writeback_cpu][pref_class]++;
+                            /* IPCP edit end */
+
                             uint8_t  prior_returned = MSHR.entry[mshr_index].returned;
                             uint64_t prior_event_cycle = MSHR.entry[mshr_index].event_cycle;
 			    MSHR.entry[mshr_index] = WQ.entry[index];
@@ -648,6 +660,10 @@ void CACHE::handle_read()
                 {
                     pf_useful++;
                     pf_useful_epoch++;
+                    /* IPCP edit start */
+                    uint32_t pref_class = block[set][way].pf_metadata % 6;
+                    pref_useful[read_cpu][pref_class]++;
+                    /* IPCP edit end */
                     block[set][way].prefetch = 0;
                 }
                 block[set][way].used = 1;
@@ -791,6 +807,10 @@ void CACHE::handle_read()
                         {
                             // RBERA: add late prefetch stats here
                             pf_late++;
+                            /* IPCP edit start */
+                            uint32_t pref_class = MSHR.entry[mshr_index].pf_metadata % 6;
+                            pref_late[read_cpu][pref_class]++;
+                            /* IPCP edit end */
                             uint8_t  prior_returned = MSHR.entry[mshr_index].returned;
                             uint64_t prior_event_cycle = MSHR.entry[mshr_index].event_cycle;
                             MSHR.entry[mshr_index] = RQ.entry[index];
@@ -1047,6 +1067,13 @@ void CACHE::handle_prefetch()
                             MSHR.entry[mshr_index].fill_level = PQ.entry[index].fill_level;
                         }
 
+                        /* IPCP edit start */
+                        if (MSHR.entry[mshr_index].type != PREFETCH) {
+                            uint32_t pref_class = PQ.entry[index].pf_metadata % 6;
+                            pref_late[prefetch_cpu][pref_class]++;
+                        }
+                        /* IPCP edit end */
+
                         MSHR_MERGED[PQ.entry[index].type]++;
 
                         DP ( if (warmup_complete[prefetch_cpu]) {
@@ -1158,6 +1185,7 @@ void CACHE::fill_cache(uint32_t set, uint32_t way, PACKET *packet)
     block[set][way].depth = packet->depth;
     block[set][way].signature = packet->signature;
     block[set][way].confidence = packet->confidence;
+    block[set][way].pf_metadata = packet->pf_metadata; // IPCP edit
 
     block[set][way].tag = packet->address;
     block[set][way].address = packet->address;

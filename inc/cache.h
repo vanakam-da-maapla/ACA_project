@@ -106,6 +106,13 @@ class CACHE : public MEMORY {
              pf_useless,
              pf_late;
 
+    // IPCP edit -- start
+    // IPCP prefetch class stats [NUM_CPUS][6 classes]; class comes from pf_metadata % 6
+    uint64_t pref_useful[NUM_CPUS][6],
+             pref_filled[NUM_CPUS][6],
+             pref_late[NUM_CPUS][6];
+    // IPCP edit -- end
+
     /* for computing memory subsystem bw */
     uint32_t bw_compute_epoch;
 
@@ -183,6 +190,15 @@ class CACHE : public MEMORY {
         pf_useful = 0;
         pf_useless = 0;
         pf_late = 0;
+
+        // IPCP edit -- start
+        for (uint32_t i = 0; i < NUM_CPUS; i++)
+            for (uint32_t j = 0; j < 6; j++) {
+                pref_useful[i][j] = 0;
+                pref_filled[i][j] = 0;
+                pref_late[i][j] = 0;
+            }
+        // IPCP edit -- end
 
         cycle = 0; next_measure_cycle = 0;
         pf_useful_epoch = 0; pf_filled_epoch = 0;

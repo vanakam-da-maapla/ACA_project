@@ -15,7 +15,6 @@
 #include "mlop.h"
 #include "bingo.h"
 #include "stride.h"
-#include "ipcp_L2.h"
 #include "ampm.h"
 #include "streamer.h"
 #include "pref_power7.h"
@@ -115,12 +114,6 @@ void CACHE::l2c_prefetcher_initialize()
 			POWER7_Pref *pref_power7 = new POWER7_Pref(knob::l2c_prefetcher_types[index], this);
 			prefetchers.push_back(pref_power7);
 		}
-		else if(!knob::l2c_prefetcher_types[index].compare("ipcp"))
-		{
-			cout << "adding L2C_PREFETCHER: IPCP" << endl;
-			IPCP_L2 *pref_ipcp_L2 = new IPCP_L2(knob::l2c_prefetcher_types[index], this);
-			prefetchers.push_back(pref_ipcp_L2);
-		}
 		else if (!knob::l2c_prefetcher_types[index].compare("ampm"))
 		{
 			cout << "adding L2C_PREFETCHER: AMPM" << endl;
@@ -142,20 +135,11 @@ uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache
 	vector<uint64_t> pref_addr;
 	for(uint32_t index = 0; index < prefetchers.size(); ++index)
 	{
-		if(knob::l2c_prefetcher_types[index].compare("ipcp"))
-		{
-			prefetchers[index]->invoke_prefetcher(ip, addr, cache_hit, type, pref_addr);
-		}
-		else /* means IPCP */
-		{
-			IPCP_L2 *pref_ipcp_L2 = (IPCP_L2*)prefetchers[index];
-			pref_ipcp_L2->invoke_prefetcher(ip, addr, cache_hit, type, metadata_in, pref_addr);
-		}
+		prefetchers[index]->invoke_prefetcher(ip, addr, cache_hit, type, pref_addr);
 		if(knob::l2c_prefetcher_types[index].compare("spp_dev2")
 			&& knob::l2c_prefetcher_types[index].compare("spp_ppf_dev")
 			&& knob::l2c_prefetcher_types[index].compare("mlop")
 			&& knob::l2c_prefetcher_types[index].compare("bingo")
-			&& knob::l2c_prefetcher_types[index].compare("ipcp")
 			&& !pref_addr.empty())
 		{
 			for(uint32_t addr_index = 0; addr_index < pref_addr.size(); ++addr_index)
