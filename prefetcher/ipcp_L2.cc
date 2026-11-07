@@ -5,6 +5,13 @@ namespace knob
 
 }
 
+// CPD-UCP hooks (defined only when the LLC policy is cpd_ucp; weak => null otherwise,
+// in which case IPCP-L2 behaves exactly as the original code).
+extern "C" void cpd_on_l2_access(uint32_t cpu, uint64_t line_addr, uint32_t type) __attribute__((weak));
+extern "C" void cpd_on_candidates(uint32_t cpu, uint64_t trigger_line, const uint64_t *cand, int n) __attribute__((weak));
+extern "C" int  cpd_get_degree(uint32_t cpu) __attribute__((weak));
+static const int CPD_CAND_MAX = 8;
+
 void IPCP_L2::init_knobs()
 {
 
@@ -60,6 +67,9 @@ void IPCP_L2::invoke_prefetcher(uint64_t ip, uint64_t addr, uint8_t cache_hit, u
    int64_t stride = decode_stride(metadata_in);
    uint32_t pref_type = metadata_in & 0xF00;
    uint16_t ip_tag = (ip >> NUM_IP_INDEX_BITS) & ((1 << NUM_IP_TAG_BITS)-1);
+   const bool cpd = (cpd_get_degree != nullptr);
+   if (cpd && cpd_on_l2_access) cpd_on_l2_access(cpu, cl_addr, type);
+   const int cpd_deg = cpd ? cpd_get_degree(cpu) : -1;
 
    if(NUM_CPUS == 1){
      if (m_parent_cache->MSHR.occupancy < (1*m_parent_cache->MSHR.SIZE)/2)
@@ -83,6 +93,11 @@ void IPCP_L2::invoke_prefetcher(uint64_t ip, uint64_t addr, uint8_t cache_hit, u
 
       // issue a next line prefetch upon encountering new IP
       uint64_t pf_address = ((addr>>LOG2_BLOCK_SIZE)+1) << LOG2_BLOCK_SIZE;
+      if (cpd) {
+         uint64_t c1 = cl_addr + 1;
+         if (cpd_on_candidates) cpd_on_candidates(cpu, cl_addr, &c1, 1);
+         if (cpd_deg >= 1) m_parent_cache->prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+      } else
       m_parent_cache->prefetch_line(ip, addr, pf_address, FILL_L2, 0);
       SIG_DP(cout << "1, ");
       // return metadata_in;
@@ -110,6 +125,19 @@ void IPCP_L2::invoke_prefetcher(uint64_t ip, uint64_t addr, uint8_t cache_hit, u
          if(trackers[cpu][index].pref_type == 0x100)
           if(NUM_CPUS == 1)
              prefetch_degree = 4;
+           if (cpd) {
+               // compute the full candidate list (up to CPD_CAND_MAX, same page), let the
+               // shadow UMONs see all of it, and issue only the first cpd_deg candidates
+               uint64_t cand[CPD_CAND_MAX]; int n = 0;
+               for (int i=0; i<CPD_CAND_MAX; i++) {
+                   uint64_t pf_address = (cl_addr + (trackers[cpu][index].stride*(i+1))) << LOG2_BLOCK_SIZE;
+                   if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE)) break;
+                   cand[n++] = pf_address >> LOG2_BLOCK_SIZE;
+               }
+               if (cpd_on_candidates && n) cpd_on_candidates(cpu, cl_addr, cand, n);
+               for (int i=0; i<n && i<cpd_deg; i++)
+                   m_parent_cache->prefetch_line(ip, addr, cand[i] << LOG2_BLOCK_SIZE, FILL_L2, 0);
+           } else
            for (int i=0; i<prefetch_degree; i++) {
                uint64_t pf_address = (cl_addr + (trackers[cpu][index].stride*(i+1))) << LOG2_BLOCK_SIZE;
 
@@ -123,6 +151,11 @@ void IPCP_L2::invoke_prefetcher(uint64_t ip, uint64_t addr, uint8_t cache_hit, u
       }
       else if(trackers[cpu][index].pref_type == 0x400 && spec_nl_l2[cpu] > 0){
       uint64_t pf_address = ((addr>>LOG2_BLOCK_SIZE)+1) << LOG2_BLOCK_SIZE;
+      if (cpd) {
+         uint64_t c1 = cl_addr + 1;
+         if (cpd_on_candidates) cpd_on_candidates(cpu, cl_addr, &c1, 1);
+         if (cpd_deg >= 1) m_parent_cache->prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+      } else
       m_parent_cache->prefetch_line(ip, addr, pf_address, FILL_L2, 0);
       SIG_DP(cout << "1;");
       }
