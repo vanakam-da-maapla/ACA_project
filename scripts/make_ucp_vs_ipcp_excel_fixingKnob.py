@@ -16,14 +16,14 @@ Experiments without logs are skipped (UCP is required: it is the baseline).  Eve
     X over UCP   for every other experiment X        (what the prefetcher / UCP+prefetcher gains over UCP alone)
     UCP_IPCP_L2 over IPCP_L2,  UCP_IPCP_L1_L2 over IPCP_L1_L2   (isolate what UCP partitioning adds on top of IPCP)
 
-    python3 make_ucp_vs_ipcp_excel.py                                  # default folders under ./results_4core_mixes_ipcp
-    python3 make_ucp_vs_ipcp_excel.py --results-root /path/results_4core_mixes_ipcp --out my.xlsx
-    python3 make_ucp_vs_ipcp_excel.py --dir ucp=/other/ucp_logs        # use another folder for one experiment
-    python3 make_ucp_vs_ipcp_excel.py --skip ipcp_l2 ucp_ipcp_l2       # leave experiments out
-    python3 make_ucp_vs_ipcp_excel.py --alone-xlsx IPStride_SRRIP_IPC_vs_LLC_Misses.xlsx
-    python3 make_ucp_vs_ipcp_excel.py --set grid                       # + PLAIN, EQ, EQ_IPCP_L1_L2 (fixed equal way split)
-    python3 make_ucp_vs_ipcp_excel.py --set degrees                    # IPCP degree sweep
-    python3 make_ucp_vs_ipcp_excel.py --exp ucp,ucp_ipcp_l1_l2,ucp_ipcp_l1_l2_w2-2-6-6_d2 --out knobs.xlsx
+    python3 scripts/make_ucp_vs_ipcp_excel.py                                  # default folders under ./results_4core_mixes_ipcp
+    python3 scripts/make_ucp_vs_ipcp_excel.py --results-root ./results_4core_mixes_ipcp --out ucp_ipcp_fixingknob.xlsx
+    python3 scripts/make_ucp_vs_ipcp_excel.py --dir ucp=/other/ucp_logs        # use another folder for one experiment
+    python3 scripts/make_ucp_vs_ipcp_excel.py --skip ipcp_l2 ucp_ipcp_l2       # leave experiments out
+    python3 scripts/make_ucp_vs_ipcp_excel.py --alone-xlsx IPStride_SRRIP_IPC_vs_LLC_Misses.xlsx
+    python3 scripts/make_ucp_vs_ipcp_excel.py --set grid                       # + PLAIN, EQ, EQ_IPCP_L1_L2 (fixed equal way split)
+    python3 scripts/make_ucp_vs_ipcp_excel.py --set degrees                    # IPCP degree sweep
+    python3 scripts/make_ucp_vs_ipcp_excel.py --exp ucp,ucp_ipcp_l1_l2,ucp_ipcp_l1_l2_w2-2-6-6_d2 --out knobs.xlsx
 
 EXPERIMENT SETS / KNOB EXPERIMENTS (run_4core_mixes_ipcp.py --experiment grid | degrees | ...)
     --set basic    (default) the original comparison: UCP, UCP_IPCP_L2, UCP_IPCP_L1_L2, IPCP_L2, IPCP_L1_L2 (+ the L1-only extras)

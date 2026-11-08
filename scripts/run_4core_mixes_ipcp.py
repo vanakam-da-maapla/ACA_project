@@ -56,8 +56,8 @@ What it does
 
 Quick start (from the ChampSim repo root, or anywhere with --root)
     python3 run_4core_mixes_ipcp.py --list                                   # show the 50 mixes
-    python3 run_4core_mixes_ipcp.py --experiment all --build --build-only    # build the 5 binaries (LLC 2048 x 16)
-    python3 run_4core_mixes_ipcp.py --experiment all --jobs 32               # 5 x 50 mixes, 32 threads
+    python3 scripts/run_4core_mixes_ipcp.py --experiment all --build --build-only    # build the 5 binaries (LLC 2048 x 16)
+    python3 scripts/run_4core_mixes_ipcp.py --experiment all --jobs 32               # 5 x 50 mixes, 32 threads
     python3 run_4core_mixes_ipcp.py --experiment ucp_ipcp_l1_l2 --jobs 8     # a single experiment
     python3 run_4core_mixes_ipcp.py --experiment all --repl lru --jobs 32    # IPCP-alone experiments on an LRU LLC
     python3 run_4core_mixes_ipcp.py --experiment all --only 1-3 --warmup 5 --sim 20 --jobs 8   # quick trial
