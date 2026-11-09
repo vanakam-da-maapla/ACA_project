@@ -38,3 +38,7 @@ libbf/
 
 # Local experimental results
 /results_10M/
+
+# oracle study outputs
+oracle_results/
+results_4core_mixes/
