@@ -17,6 +17,7 @@ Experiments without logs are skipped (UCP is required: it is the baseline).  Eve
     UCP_IPCP_L2 over IPCP_L2,  UCP_IPCP_L1_L2 over IPCP_L1_L2   (isolate what UCP partitioning adds on top of IPCP)
 
     python3 scripts/make_ucp_vs_ipcp_excel.py                                  # default folders under ./results_4core_mixes_ipcp
+    python3 scripts/make_ucp_vs_ipcp_excel_fixingKnob.py --results-root ./results_4core_mixes_ipcp --set all --out ucp_ipcp_grid_20mixes.xlsx
     python3 scripts/make_ucp_vs_ipcp_excel.py --results-root ./results_4core_mixes_ipcp --out ucp_ipcp_fixingknob.xlsx
     python3 scripts/make_ucp_vs_ipcp_excel.py --dir ucp=/other/ucp_logs        # use another folder for one experiment
     python3 scripts/make_ucp_vs_ipcp_excel.py --skip ipcp_l2 ucp_ipcp_l2       # leave experiments out
