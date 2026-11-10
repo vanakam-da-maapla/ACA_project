@@ -42,3 +42,4 @@ libbf/
 # oracle study outputs
 oracle_results/
 results_4core_mixes/
+scaleup_8core_results/

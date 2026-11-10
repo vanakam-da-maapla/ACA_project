@@ -438,6 +438,9 @@ def make_experiment(args, spec, ap, multi):
     a = copy.copy(args)
     a.ways = a.deg = None
     a.equal = False
+    a.bw = None                  # +bw=MTPS: DRAM transfer rate (runtime knob --dram_io_freq of the simulator)
+    a.umon_demand = False        # +umon=demand: UCP's utility monitor ignores prefetch fills (needs the -knob binary)
+    a.extra_opts = list(args.extra_opts)
     name, knobs = None, []
     if spec:
         name, *knobs = spec.split("+")
@@ -449,6 +452,15 @@ def make_experiment(args, spec, ap, multi):
             a.ways = parse_vector(val, "+ways", ap, allow_equal=True, minimum=1)
         elif key in ("deg", "degree"):
             a.deg = parse_vector(val, "+deg", ap, minimum=0)
+        elif key == "bw":
+            if not val.isdigit() or int(val) < 100:
+                ap.error("+bw needs the DRAM transfer rate in MT/s, e.g. +bw=1200 (default 2400)")
+            a.bw = int(val)
+            a.extra_opts.append("--dram_io_freq=%d" % a.bw)
+        elif key == "umon":
+            if val != "demand":
+                ap.error("+umon accepts only 'demand' (UCP utility monitor ignores prefetch accesses)")
+            a.umon_demand = True
         else:
             ap.error("unknown knob '%s' in '%s' (use +ways=A-B-C-D or +deg=N)" % (k, spec))
     explicit = bool(knobs)
@@ -506,7 +518,8 @@ def make_experiment(args, spec, ap, multi):
             base = "ucp_%s" % a.mode                     # e.g. ucp_pythia
         else:
             base = "%s_%s" % (a.mode, a.repl)            # e.g. pythia_srrip, pythia_lru
-        a.label = base + ("_w%s" % ways_str(a.ways) if a.ways else "") + ("_d%s" % vec_text(a.deg) if a.deg else "")
+        a.label = base + ("_w%s" % ways_str(a.ways) if a.ways else "") + ("_d%s" % vec_text(a.deg) if a.deg else "") \
+            + ("_umondemand" if a.umon_demand else "") + ("_bw%d" % a.bw if a.bw else "")
     # ---- environment of the simulations
     a.env = {}
     if a.equal:
@@ -515,7 +528,11 @@ def make_experiment(args, spec, ap, multi):
         a.env["UCP_FIXED_ALLOCATION"] = ",".join(str(x) for x in a.ways)
     if a.deg is not None:
         a.env[DEGREE_ENV[a.mode]] = ",".join(str(x) for x in a.deg)
-    a.needs_knob = bool(a.ways) or a.deg is not None
+    a.needs_knob = bool(a.ways) or a.deg is not None or a.umon_demand
+    if a.umon_demand:
+        if a.repl != "ucp":
+            ap.error("+umon=demand needs a UCP experiment")
+        a.env["UCP_DEMAND_ONLY_UMON"] = "1"
     a.ways_text = ("equal" if a.equal else ways_str(a.ways) if a.ways else ("adaptive" if a.repl == "ucp" else "none"))
     a.deg_text = vec_text(a.deg) if a.deg is not None else "original"
     a.knob_text = " ".join("%s=%s" % kv for kv in sorted(a.env.items()))
@@ -558,6 +575,20 @@ def print_mix_table(mixes, tinfo, borderline, pools, margin, med_c, med_p):
     nhc = Counter((sum(c.startswith("HC") for c in m.classes), sum(c.endswith("HP") for c in m.classes))
                   for m in mixes)
     print("(#high-cache cores, #high-prefetch cores) combinations covered by the mixes: %d of 25" % len(nhc))
+
+
+def load_mixes_csv(path):
+    """Mixes from a CSV written by write_mixes_csv (any core count = --cores); ids must be 1..N."""
+    mixes = []
+    with open(path) as f:
+        for r in csv.DictReader(f):
+            mixes.append(Mix(int(r["mix_id"]), r["mix_name"], r["type"],
+                             tuple(r["core%d_class" % c] for c in range(NCORES)),
+                             tuple(r["core%d_trace" % c] for c in range(NCORES))))
+    mixes.sort(key=lambda m: m.id)
+    if [m.id for m in mixes] != list(range(1, len(mixes) + 1)):
+        sys.exit("[ERROR] %s: mix ids must be 1..N" % path)
+    return mixes
 
 
 def write_mixes_csv(path, mixes, trace_dir, tinfo):
@@ -868,6 +899,12 @@ def patch_knobs(tmp, args):
 
     if args.repl == "ucp":
         edit("replacement/ucp.llc_repl", [
+            ("    sample_access(cpu, full_addr, set);\n",
+             "    {   // experiment knob UCP_DEMAND_ONLY_UMON=1: the utility monitor ignores prefetch fills\n"
+             "        static const bool demand_only = [](){ const char *e = std::getenv(\"UCP_DEMAND_ONLY_UMON\"); return e && *e == '1'; }();\n"
+             "        if (!(demand_only && type == PREFETCH))\n"
+             "            sample_access(cpu, full_addr, set);\n"
+             "    }\n"),
             ("bool started_roi_schedule = false;\n", "bool started_roi_schedule = false;\nbool fixed_partition_mode = false;   // experiment knob UCP_FIXED_ALLOCATION\n"),
             ("    for (uint32_t i = 0; i < LLC_WAY % NUM_CPUS; ++i)\n        ++quota[i];\n",
              "    for (uint32_t i = 0; i < LLC_WAY % NUM_CPUS; ++i)\n        ++quota[i];\n" + UCP_FIXED_CODE),
@@ -1273,6 +1310,9 @@ def main():
     b.add_argument("--extra-opts", default="", help="extra simulator options, e.g. '--config=/path/x.ini'")
     b.add_argument("--no-verify", action="store_true", help="skip the LLC-geometry check (not recommended)")
     m = ap.add_argument_group("mixes")
+    m.add_argument("--cores", type=int, default=4, help="cores of the simulated system (1, 4, 8, ...); != 4 needs --mixes-csv")
+    m.add_argument("--mixes-csv", type=Path, default=None, help="read the mixes from this CSV (columns of --write-mixes) "
+                   "instead of generating the 50 four-core mixes")
     m.add_argument("--seed", type=int, default=1, help="seed of the mix generator (same seed = same 50 mixes)")
     m.add_argument("--margin", type=float, default=1.75,
                    help="only use traces at least this factor away from the High/Low median on both axes (1 = use all)")
@@ -1288,6 +1328,8 @@ def main():
             sys.exit("[ERROR] --compare-setups needs at least two results folders")
         sys.exit(compare_setups(args.compare_setups))
     args.extra_opts = args.extra_opts.split()
+    global NCORES
+    NCORES = args.cores
     if args.list_experiments:
         print_experiments(args)
         return
@@ -1322,9 +1364,14 @@ def main():
         traces, med_c, med_p = embedded_traces(), MEDIAN_CACHE, MEDIAN_PREFETCH
     pools, border = clear_pools(traces, med_c, med_p, args.margin)
     for c in CLASSES:
-        if len({family(t.name) for t in pools[c]}) < NCORES:
+        if not args.mixes_csv and len({family(t.name) for t in pools[c]}) < NCORES:
             sys.exit("[ERROR] class %s has fewer than 4 distinct benchmark families; lower --margin" % c)
-    mixes = generate_mixes(pools, args.seed)
+    if args.mixes_csv:
+        mixes = load_mixes_csv(args.mixes_csv)
+    else:
+        if NCORES != 4:
+            sys.exit("[ERROR] the built-in mix generator makes 4-core mixes; give --mixes-csv for --cores %d" % NCORES)
+        mixes = generate_mixes(pools, args.seed)
     if args.write_mixes:
         write_mixes_csv(args.write_mixes, mixes, trace_dir, traces)
         print("mixes written: %s" % args.write_mixes)
