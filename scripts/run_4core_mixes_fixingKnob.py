@@ -440,6 +440,8 @@ def make_experiment(args, spec, ap, multi):
     a.equal = False
     a.bw = None                  # +bw=MTPS: DRAM transfer rate (runtime knob --dram_io_freq of the simulator)
     a.umon_demand = False        # +umon=demand: UCP's utility monitor ignores prefetch fills (needs the -knob binary)
+    a.coord = None               # +coord=POLICY: coordination controller (src/coord.cc), e.g. victim; +cv=KEY:VAL sets COORD_KEY
+    a.coord_env = {}
     a.extra_opts = list(args.extra_opts)
     name, knobs = None, []
     if spec:
@@ -457,6 +459,15 @@ def make_experiment(args, spec, ap, multi):
                 ap.error("+bw needs the DRAM transfer rate in MT/s, e.g. +bw=1200 (default 2400)")
             a.bw = int(val)
             a.extra_opts.append("--dram_io_freq=%d" % a.bw)
+        elif key == "coord":
+            if val not in ("off", "log", "static", "victim"):
+                ap.error("+coord accepts off, log, static or victim")
+            a.coord = val
+        elif key == "cv":
+            k2, _, v2 = val.partition(":")
+            if not k2 or not v2:
+                ap.error("+cv needs KEY:VALUE, e.g. +cv=V_GAIN:0.01 (sets COORD_V_GAIN)")
+            a.coord_env["COORD_" + k2.upper()] = v2
         elif key == "umon":
             if val != "demand":
                 ap.error("+umon accepts only 'demand' (UCP utility monitor ignores prefetch accesses)")
@@ -519,7 +530,8 @@ def make_experiment(args, spec, ap, multi):
         else:
             base = "%s_%s" % (a.mode, a.repl)            # e.g. pythia_srrip, pythia_lru
         a.label = base + ("_w%s" % ways_str(a.ways) if a.ways else "") + ("_d%s" % vec_text(a.deg) if a.deg else "") \
-            + ("_umondemand" if a.umon_demand else "") + ("_bw%d" % a.bw if a.bw else "")
+            + ("_umondemand" if a.umon_demand else "") + ("_coord%s" % a.coord if a.coord else "") \
+            + "".join("_%s%s" % (k[6:].lower(), v) for k, v in sorted(a.coord_env.items())) + ("_bw%d" % a.bw if a.bw else "")
     # ---- environment of the simulations
     a.env = {}
     if a.equal:
@@ -529,6 +541,10 @@ def make_experiment(args, spec, ap, multi):
     if a.deg is not None:
         a.env[DEGREE_ENV[a.mode]] = ",".join(str(x) for x in a.deg)
     a.needs_knob = bool(a.ways) or a.deg is not None or a.umon_demand
+    if a.coord:
+        a.env["COORD_POLICY"] = a.coord
+        a.env.setdefault("COORD_QUIET", "1")
+    a.env.update(a.coord_env)
     if a.umon_demand:
         if a.repl != "ucp":
             ap.error("+umon=demand needs a UCP experiment")

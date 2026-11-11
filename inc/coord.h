@@ -10,9 +10,26 @@
 //             COORD_STATIC_WAYS   LLC way allocation, "equal" or one value per core ("2-2-6-6"; sum = LLC_WAY,
 //                                 each >= 1). Needs the ucp LLC replacement. UCP's own repartition timer is
 //                                 switched off. If unset, UCP keeps allocating by itself.
+//   victim  victim-aware, partition-aware prefetch throttling (VPT).  UCP keeps partitioning the LLC; every epoch
+//           the controller looks at DRAM pressure and at each core's useless prefetch traffic.  Under pressure it
+//           TRIES throttling the core whose prefetches cost the most DRAM bandwidth for the least benefit (one level
+//           down for COORD_V_TRIAL epochs) and KEEPS the change only if the harmonic mean of every core's IPC
+//           relative to its recent IPC improves by COORD_V_GAIN -- i.e. only if the other cores (the victims the
+//           partition is protecting) gain more than the throttled core loses.  When DRAM is calm, or every
+//           COORD_V_RETEST epochs, throttled cores are tried one level up again (phase changes).  Rejected trials
+//           put the core in a cool-down.  Partition awareness: the score is measured on the cores' IPC under the
+//           current UCP allocation, so the controller only keeps throttling that helps the cores UCP protects, and
+//           UCP's utility monitor sees the reduced prefetch fills at its next repartition.
+//           COORD_V_BW      DRAM pressure threshold: mean DRAM bandwidth level over the epoch (0..3, Pythia's
+//                           quartiles of peak bandwidth), default 1.5 (= busy about half the time or more)
+//           COORD_V_GAIN    minimum relative gain to keep a throttle step (default 0.005)
+//           COORD_V_TRIAL   epochs per trial (default 2);  COORD_V_COOLDOWN  epochs after a rejected trial (16)
+//           COORD_V_CALM    calm epochs before trying a core one level up (4);  COORD_V_RETEST  forced retest (32)
+//           COORD_V_SHARE   a candidate's useless-prefetch traffic must be >= this x the per-core average (0.5)
 //
 // Environment:
 //   COORD_EPOCH_CYCLES  epoch length in uncore cycles (default 1000000)
+//   COORD_QUIET=1       do not print the per-epoch COORD_G / COORD_C lines (COORD_V decision lines are kept)
 //
 // The throttle sits in CACHE::prefetch_line()/kpc_prefetch_line(), the common entry point of every prefetcher
 // into the private L1D and L2C prefetch queues, so it works for any prefetcher without editing it.
@@ -35,5 +52,6 @@ void coord_tick();              // call every uncore cycle after uncore.cycle++ 
 // Called from CACHE::prefetch_line() when coord_gate_active. Returns false if this request must be dropped.
 bool coord_pf_allow(uint32_t cpu, uint8_t cache_type);
 int  coord_level(uint32_t cpu); // current prefetch level of a core (for prefetcher adapters)
+void coord_final_stats();       // end-of-run summary (victim policy)
 
 #endif /* COORD_H */

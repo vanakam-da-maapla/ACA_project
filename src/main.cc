@@ -1041,6 +1041,7 @@ int main(int argc, char** argv)
 #ifndef CRC2_COMPILE
     uncore.LLC.llc_replacement_final_stats();
     print_dram_stats();
+    coord_final_stats();   // coordination controller summary (victim policy only)
 #endif
 
     return 0;

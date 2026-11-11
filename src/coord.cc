@@ -18,7 +18,7 @@ bool coord_gate_active = false;
 
 namespace {
 
-enum Policy { POLICY_OFF = 0, POLICY_LOG = 1, POLICY_STATIC = 2 };
+enum Policy { POLICY_OFF = 0, POLICY_LOG = 1, POLICY_STATIC = 2, POLICY_VICTIM = 3 };
 
 Policy   policy       = POLICY_OFF;
 uint64_t epoch_cycles = 1000000;
@@ -51,6 +51,28 @@ struct Snap {
 };
 
 Snap last_snap;
+bool quiet = false;
+
+// ---- victim-aware, partition-aware prefetch throttling (POLICY_VICTIM) -----------------------------------------
+struct VParams {
+    double   bw_hi = 1.5, gain = 0.005, share = 0.5, alpha = 0.3;
+    uint32_t trial = 2, cooldown = 16, calm = 4, retest = 32;
+};
+VParams  vp;
+double   bw_acc = 0.0;                    // sum of the DRAM bandwidth level over the cycles of the epoch
+uint64_t bw_n = 0;
+bool     ref_ok = false;
+double   ref_ipc[NUM_CPUS];               // recent IPC of every core (EWMA over epochs without a trial)
+double   cost_ewma[NUM_CPUS];             // useless prefetch DRAM reads per kilo-cycle (EWMA)
+double   acc_ewma[NUM_CPUS];              // prefetch accuracy (EWMA)
+uint32_t cooldown_left[NUM_CPUS];
+bool     in_trial = false;
+int      trial_core = -1, trial_dir = 0;
+uint32_t trial_left = 0, trial_n = 0;
+double   trial_score = 0.0, trial_self = 0.0;
+uint32_t calm_epochs = 0, since_retest = 0;
+uint64_t n_down_ok = 0, n_down_rej = 0, n_up_ok = 0, n_up_rej = 0;
+uint64_t level_epochs[NUM_CPUS][COORD_LEVELS];
 
 PfCounters read_pf(const CACHE &c)
 {
@@ -120,15 +142,136 @@ bool parse_per_core(const char *text, uint32_t *out)
     std::exit(1);
 }
 
+void update_gate()
+{
+    coord_gate_active = false;
+    for (uint32_t i = 0; i < NUM_CPUS; i++)
+        if (level[i] < COORD_LEVELS - 1)
+            coord_gate_active = true;
+}
+
+void start_trial(int j, int dir, const char *why, double bwavg)
+{
+    level[j] = (uint8_t)((int)level[j] + dir);
+    in_trial = true;
+    trial_core = j;
+    trial_dir = dir;
+    trial_left = vp.trial;
+    trial_n = 0;
+    trial_score = trial_self = 0.0;
+    update_gate();
+    std::printf("COORD_V e=%llu trial core=%d %s to level %u (%s, bw=%.2f, cost=%.3f, acc=%.3f)\n",
+                (unsigned long long)epoch_index, j, dir < 0 ? "down" : "up", (unsigned)level[j], why, bwavg,
+                cost_ewma[j], acc_ewma[j]);
+}
+
+// One decision step at the end of an epoch (deltas between o and n).
+void victim_step(const Snap &n, const Snap &o, double bwavg)
+{
+    double ipc[NUM_CPUS];
+    for (uint32_t i = 0; i < NUM_CPUS; i++) {
+        const CoreSnap &a = n.core[i], &b = o.core[i];
+        const uint64_t dins = a.retired - b.retired, dcyc = a.cycles - b.cycles;
+        ipc[i] = dcyc ? (double)dins / (double)dcyc : 0.0;
+        const double use = (double)(a.l1d.useful - b.l1d.useful + a.l2c.useful - b.l2c.useful);
+        const double unu = (double)(a.l1d.useless - b.l1d.useless + a.l2c.useless - b.l2c.useless);
+        const double acc = use + unu > 0 ? use / (use + unu) : 1.0;
+        const double cost = (double)(a.llc_pfmiss - b.llc_pfmiss) * (1.0 - acc) * 1000.0 / (double)epoch_cycles;
+        if (level[i] == COORD_LEVELS - 1 || !ref_ok) {        // judge a core by its unthrottled behaviour
+            cost_ewma[i] = ref_ok ? vp.alpha * cost + (1 - vp.alpha) * cost_ewma[i] : cost;
+            if (use + unu > 0)
+                acc_ewma[i] = ref_ok ? vp.alpha * acc + (1 - vp.alpha) * acc_ewma[i] : acc;
+        }
+        level_epochs[i][level[i]]++;
+    }
+    calm_epochs = bwavg >= vp.bw_hi ? 0 : calm_epochs + 1;
+    if (!ref_ok) {
+        for (uint32_t i = 0; i < NUM_CPUS; i++)
+            ref_ipc[i] = ipc[i];
+        ref_ok = true;
+        return;
+    }
+    if (in_trial) {
+        double inv = 0.0;
+        for (uint32_t i = 0; i < NUM_CPUS; i++) {
+            const double r = ref_ipc[i] > 0 ? ipc[i] / ref_ipc[i] : 1.0;
+            inv += 1.0 / (r > 1e-3 ? r : 1e-3);
+        }
+        trial_score += (double)NUM_CPUS / inv;                // harmonic mean: throughput that respects fairness
+        trial_self += ref_ipc[trial_core] > 0 ? ipc[trial_core] / ref_ipc[trial_core] : 1.0;
+        trial_n++;
+        if (--trial_left > 0)
+            return;
+        const double score = trial_score / trial_n, self = trial_self / trial_n;
+        const bool ok = trial_dir < 0 ? score >= 1.0 + vp.gain : score >= 1.0 - vp.gain / 2;
+        const int j = trial_core;
+        if (ok) {
+            (trial_dir < 0 ? n_down_ok : n_up_ok)++;
+            cooldown_left[j] = trial_dir < 0 ? vp.cooldown / 4 : 0;
+        } else {
+            (trial_dir < 0 ? n_down_rej : n_up_rej)++;
+            level[j] = (uint8_t)((int)level[j] - trial_dir);
+            cooldown_left[j] = vp.cooldown;
+        }
+        std::printf("COORD_V e=%llu %s core=%d level=%u score=%.4f self=%.4f (down %llu/%llu up %llu/%llu kept)\n",
+                    (unsigned long long)epoch_index, ok ? "keep" : "revert", j, (unsigned)level[j], score, self,
+                    (unsigned long long)n_down_ok, (unsigned long long)(n_down_ok + n_down_rej),
+                    (unsigned long long)n_up_ok, (unsigned long long)(n_up_ok + n_up_rej));
+        in_trial = false;
+        update_gate();
+        for (uint32_t i = 0; i < NUM_CPUS; i++)               // new reference = behaviour with the decision applied
+            ref_ipc[i] = ipc[i];
+        return;
+    }
+    for (uint32_t i = 0; i < NUM_CPUS; i++) {
+        ref_ipc[i] = vp.alpha * ipc[i] + (1 - vp.alpha) * ref_ipc[i];
+        if (cooldown_left[i])
+            cooldown_left[i]--;
+    }
+    since_retest++;
+    if (bwavg >= vp.bw_hi) {                                   // pressure: try the most wasteful prefetcher
+        double total = 0.0;
+        int j = -1;
+        for (uint32_t i = 0; i < NUM_CPUS; i++) {
+            total += cost_ewma[i];
+            if (level[i] > 0 && !cooldown_left[i] && (j < 0 || cost_ewma[i] > cost_ewma[j]))
+                j = (int)i;
+        }
+        if (j >= 0 && total > 0 && cost_ewma[j] >= vp.share * total / NUM_CPUS) {
+            start_trial(j, -1, "pressure", bwavg);
+            return;
+        }
+    }
+    int up = -1;                                               // calm, or time to re-test: give one level back
+    if (calm_epochs >= vp.calm || since_retest >= vp.retest)
+        for (uint32_t i = 0; i < NUM_CPUS; i++)
+            if (level[i] < COORD_LEVELS - 1 && !cooldown_left[i] && (up < 0 || acc_ewma[i] > acc_ewma[up]))
+                up = (int)i;
+    if (up >= 0) {
+        since_retest = 0;
+        start_trial(up, +1, calm_epochs >= vp.calm ? "calm" : "retest", bwavg);
+    }
+}
+
 void epoch_boundary()
 {
     Snap now;
     take(now);
+    const double bwavg = bw_n ? bw_acc / (double)bw_n : 0.0;
+    bw_acc = 0.0;
+    bw_n = 0;
+    if (policy == POLICY_VICTIM)
+        victim_step(now, last_snap, bwavg);
+    if (quiet) {
+        last_snap = now;
+        epoch_index++;
+        return;
+    }
 
     // one global line, then one line per core; all values are deltas over the epoch that just ended
-    std::printf("COORD_G e=%llu cycle=%llu dram_bw=%u dram_enq=%llu\n",
+    std::printf("COORD_G e=%llu cycle=%llu dram_bw=%u dram_bw_avg=%.3f dram_enq=%llu\n",
                 (unsigned long long)epoch_index, (unsigned long long)uncore.cycle,
-                (unsigned)uncore.DRAM.bw, (unsigned long long)(now.dram_enqueue - last_snap.dram_enqueue));
+                (unsigned)uncore.DRAM.bw, bwavg, (unsigned long long)(now.dram_enqueue - last_snap.dram_enqueue));
 
     for (uint32_t i = 0; i < NUM_CPUS; i++) {
         const CoreSnap &n = now.core[i], &o = last_snap.core[i];
@@ -159,8 +302,10 @@ void coord_init()
         policy = POLICY_LOG;
     } else if (!std::strcmp(p, "static")) {
         policy = POLICY_STATIC;
+    } else if (!std::strcmp(p, "victim")) {
+        policy = POLICY_VICTIM;
     } else {
-        std::fprintf(stderr, "[COORD] unknown COORD_POLICY '%s' (use off|log|static)\n", p);
+        std::fprintf(stderr, "[COORD] unknown COORD_POLICY '%s' (use off|log|static|victim)\n", p);
         std::exit(1);
     }
     for (uint32_t i = 0; i < NUM_CPUS; i++)
@@ -174,6 +319,21 @@ void coord_init()
         epoch_cycles = (uint64_t)n;
     }
 
+    if (const char *q = std::getenv("COORD_QUIET"))
+        quiet = *q == '1';
+    if (policy == POLICY_VICTIM) {
+        auto num = [](const char *name, double &v) { if (const char *e = std::getenv(name)) v = std::atof(e); };
+        auto cnt = [](const char *name, uint32_t &v) { if (const char *e = std::getenv(name)) v = (uint32_t)std::atoi(e); };
+        num("COORD_V_BW", vp.bw_hi);
+        num("COORD_V_GAIN", vp.gain);
+        num("COORD_V_SHARE", vp.share);
+        cnt("COORD_V_TRIAL", vp.trial);
+        cnt("COORD_V_COOLDOWN", vp.cooldown);
+        cnt("COORD_V_CALM", vp.calm);
+        cnt("COORD_V_RETEST", vp.retest);
+        if (vp.trial < 1)
+            die("COORD_V_TRIAL must be >= 1");
+    }
     if (policy == POLICY_STATIC) {
         if (const char *l = std::getenv("COORD_STATIC_LEVEL")) {
             uint32_t v[NUM_CPUS];
@@ -223,11 +383,19 @@ void coord_arm()
     next_epoch  = uncore.cycle + epoch_cycles;
     coord_armed = true;
     std::printf("[COORD] policy=%s epoch_cycles=%llu cores=%u first_boundary=%llu\n",
-                policy == POLICY_STATIC ? "static" : "log", (unsigned long long)epoch_cycles, (unsigned)NUM_CPUS, (unsigned long long)next_epoch);
+                policy == POLICY_STATIC ? "static" : policy == POLICY_VICTIM ? "victim" : "log",
+                (unsigned long long)epoch_cycles, (unsigned)NUM_CPUS, (unsigned long long)next_epoch);
+    if (policy == POLICY_VICTIM)
+        std::printf("[COORD] victim: bw>=%.2f gain=%.4f share=%.2f trial=%u cooldown=%u calm=%u retest=%u\n",
+                    vp.bw_hi, vp.gain, vp.share, vp.trial, vp.cooldown, vp.calm, vp.retest);
 }
 
 void coord_tick()
 {
+    if (policy == POLICY_VICTIM) {
+        bw_acc += uncore.DRAM.bw;
+        bw_n++;
+    }
     if (uncore.cycle < next_epoch)
         return;
     epoch_boundary();
@@ -255,4 +423,20 @@ bool coord_pf_allow(uint32_t cpu, uint8_t cache_type)
 int coord_level(uint32_t cpu)
 {
     return cpu < NUM_CPUS ? level[cpu] : COORD_LEVELS - 1;
+}
+
+// Summary printed once at the end of the simulation (called from print_dram_stats' caller in main.cc).
+void coord_final_stats()
+{
+    if (policy != POLICY_VICTIM)
+        return;
+    std::printf("COORD_VSUM trials_down_kept=%llu trials_down=%llu trials_up_kept=%llu trials_up=%llu\n",
+                (unsigned long long)n_down_ok, (unsigned long long)(n_down_ok + n_down_rej),
+                (unsigned long long)n_up_ok, (unsigned long long)(n_up_ok + n_up_rej));
+    for (uint32_t i = 0; i < NUM_CPUS; i++) {
+        std::printf("Core_%u_coord_epochs_at_level", i);
+        for (uint32_t l = 0; l < COORD_LEVELS; l++)
+            std::printf(" %llu", (unsigned long long)level_epochs[i][l]);
+        std::printf("\nCore_%u_coord_final_level %u\n", i, (unsigned)level[i]);
+    }
 }
