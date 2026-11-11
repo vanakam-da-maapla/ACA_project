@@ -373,6 +373,16 @@ class Study:
             return log
         if self.a.dry_run or self.stop:
             return None
+        if self.a.oracle_only and r.tier in (0, 1, 2):
+            # --oracle-only: parts 0-2 are never simulated here (they may still be running from the first start);
+            # wait for their log instead of starting a duplicate
+            while not self.stop:
+                time.sleep(300)
+                log = find_log(d)
+                if log and parse_log(log, r.cores)["complete"]:
+                    self.status[str(d)] = "OK"
+                    return log
+            return None
         if r.tier > 0 and time.time() + self.est_minutes(r) * 60 > self.deadline:
             self.status[str(d)] = "SKIPPED (time budget)"
             return None
@@ -469,10 +479,12 @@ class Study:
                                  note="no improvement -> stop (%d tried)" % len(cands)))
                 break
         others = sorted([c for c in evaluated if c != base_cfg], key=lambda c: -evaluated[c][0])
-        pick = others[:3]                                                   # 3 highest throughput
+        top = self.a.oracle_top
+        n_thr = max(1, top - 2) if top >= 3 else top
+        pick = others[:n_thr]                                               # highest throughput
         fair = sorted([c for c in others if c not in pick and evaluated[c][0] >= 1.0], key=lambda c: -evaluated[c][1])
-        pick += fair[:2]                                                    # + 2 fairest that do not lose throughput
-        pick += [c for c in others if c not in pick][:5 - len(pick)]
+        pick += fair[:top - len(pick)]                                      # + fairest that do not lose throughput
+        pick += [c for c in others if c not in pick][:top - len(pick)]
         # validation at the full length, against the independent run of part 1 (same mix, same bandwidth)
         base_full = self.submit(Run(1, "ucp_%s_bw%d" % (pf, LOW_BW), PFS[pf]["ucp"] + low, False, mix, n, LOW_BW,
                                     "both", pf, (1, mix)))
@@ -926,6 +938,11 @@ def main():
     ap.add_argument("--oracle-rounds", type=int, default=1, help="greedy oracle rounds (1 = all single changes once)")
     ap.add_argument("--levels", default="0,2", help="oracle degree caps besides native (%d)" % NATIVE)
     ap.add_argument("--no-oracle", action="store_true", help="skip part 3")
+    ap.add_argument("--oracle-only", action="store_true", help="run only part 3; parts 0-2 are never simulated (the "
+                    "oracle waits for the part-1 baseline logs of the first start)")
+    ap.add_argument("--oracle-prefetchers", default="pythia,ipcp", help="prefetchers of part 3")
+    ap.add_argument("--oracle-mixes", default="", help="mix ids of part 3 (default: all)")
+    ap.add_argument("--oracle-top", type=int, default=5, help="configurations validated per mix and prefetcher")
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--no-build", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
@@ -954,14 +971,18 @@ def main():
     write_mixes(a.out / "mixes_8core.csv", mixes, CORES)
     write_mixes(a.out / "mixes_alone.csv", alone, 1)
     runs = [r for r in plan_runs(mixes, alone, a) if r.tier == 0 or not sel or r.mix in sel]
-    omixes = [] if a.no_oracle else [m for m in used]
+    osel = {int(x) for x in a.oracle_mixes.split(",") if x}
+    omixes = [] if a.no_oracle else [m for m in used if not osel or m["id"] in osel]
+    opfs = [p for p in a.oracle_prefetchers.split(",") if p in PFS]
+    if a.oracle_only:
+        runs = []
     cnt = Counter("part%d" % r.tier for r in runs)
     est = {k: sum(a.rate * (a.warmup + a.sim) * r.cores / 4.0 for r in runs if "part%d" % r.tier == k) for k in cnt}
     n1 = len(neighbours(("A", (NATIVE,) * CORES), (1, 1, 1, 1, 1, 1, 5, 5), a.levels, True))
     if omixes:
-        cnt["part3 oracle"] = len(omixes) * len(PFS) * (1 + n1 * a.oracle_rounds + 5)
-        est["part3 oracle"] = len(omixes) * len(PFS) * a.rate * CORES / 4.0 * (
-            (1 + n1 * a.oracle_rounds) * sum(a.oracle_len) + 5 * (a.warmup + a.sim))
+        cnt["part3 oracle"] = len(omixes) * len(opfs) * (1 + n1 * a.oracle_rounds + a.oracle_top)
+        est["part3 oracle"] = len(omixes) * len(opfs) * a.rate * CORES / 4.0 * (
+            (1 + n1 * a.oracle_rounds) * sum(a.oracle_len) + a.oracle_top * (a.warmup + a.sim))
     print("8-core study: %d mixes (the same in every part), %d distinct traces; about %d simulations: %s"
           % (len(used), len(traces), sum(cnt.values()), ", ".join("%s %d" % kv for kv in sorted(cnt.items()))))
     print("  first estimate with %d jobs: %s  -> total %.1f h if perfectly packed (the real speed is measured as runs "
@@ -982,7 +1003,7 @@ def main():
     S = Study(a, mixes, alone)
     def start_oracle():
         ds = []
-        for p in PFS:
+        for p in opfs:
             for m in omixes:
                 with S.cv:
                     S.drivers += 1

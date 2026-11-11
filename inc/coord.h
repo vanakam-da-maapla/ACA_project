@@ -28,6 +28,10 @@
 //           COORD_V_TRIAL   epochs per trial (default 2);  COORD_V_COOLDOWN  epochs after a rejected trial (16)
 //           COORD_V_CALM    calm epochs before trying a core one level up (4);  COORD_V_RETEST  forced retest (32)
 //           COORD_V_SHARE   a candidate's useless-prefetch traffic must be >= this x the per-core average (0.5)
+//           COORD_V_PART=1  partition inputs from UCP (its current ways per core): (1) the trial score weights every
+//                           core by 1 + ways/average ways, so cores UCP protects as cache-sensitive count more;
+//                           (2) the bandwidth-hog ranking scales prefetch traffic by average ways / ways, so cores
+//                           UCP gives few ways (little cache benefit, typically streamers) are suspected first
 //
 // Environment:
 //   COORD_EPOCH_CYCLES  epoch length in uncore cycles (default 1000000)

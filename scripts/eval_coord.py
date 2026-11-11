@@ -130,7 +130,7 @@ def main():
     odir = (a.oracle_dir or root / "oracle_results").resolve()
     sdir = (a.scaleup_dir or root / "scaleup_8core_results").resolve()
     out = (a.out or root / "eval_results").resolve()
-    variants = [("vpt", "+coord=victim")] + [(v.split("=", 1)[0], "+coord=victim" + v.split("=", 1)[1]) for v in a.variant]
+    variants = [("vpt", "+coord=victim"), ("vpt_part", "+coord=victim+cv=V_PART:1")] + [(v.split("=", 1)[0], "+coord=victim" + v.split("=", 1)[1]) for v in a.variant]
     pfs = [p for p in a.prefetchers.split(",") if p]
     setups = [s for s in a.setups.split(",") if s]
     if a.mixes_4core:

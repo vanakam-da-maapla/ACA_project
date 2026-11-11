@@ -56,6 +56,7 @@ bool quiet = false;
 // ---- victim-aware, partition-aware prefetch throttling (POLICY_VICTIM) -----------------------------------------
 struct VParams {
     double   bw_hi = 1.5, gain = 0.005, share = 0.5, alpha = 0.3;
+    bool     part = false;                // COORD_V_PART=1: use UCP's way allocation (see coord.h)
     uint32_t trial = 2, cooldown = 16, calm = 4, retest = 32;
 };
 VParams  vp;
@@ -195,13 +196,19 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
         ref_ok = true;
         return;
     }
+    // partition input: UCP's current ways per core (cache sensitivity as judged by UCP's utility monitors)
+    double ways[NUM_CPUS], avgw = (double)LLC_WAY / NUM_CPUS;
+    for (uint32_t i = 0; i < NUM_CPUS; i++)
+        ways[i] = (vp.part && ucp_quota_of) ? (double)ucp_quota_of(i) : avgw;
     if (in_trial) {
-        double inv = 0.0;
+        double inv = 0.0, wsum = 0.0;
         for (uint32_t i = 0; i < NUM_CPUS; i++) {
             const double r = ref_ipc[i] > 0 ? ipc[i] / ref_ipc[i] : 1.0;
-            inv += 1.0 / (r > 1e-3 ? r : 1e-3);
+            const double w = vp.part ? 1.0 + ways[i] / avgw : 1.0;   // cores UCP protects count more
+            inv += w / (r > 1e-3 ? r : 1e-3);
+            wsum += w;
         }
-        trial_score += (double)NUM_CPUS / inv;                // harmonic mean: throughput that respects fairness
+        trial_score += wsum / inv;                            // (weighted) harmonic mean: throughput that respects fairness
         trial_self += ref_ipc[trial_core] > 0 ? ipc[trial_core] / ref_ipc[trial_core] : 1.0;
         trial_n++;
         if (--trial_left > 0)
@@ -239,7 +246,10 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
         // DRAM traffic of any kind (accurate streamers that eat the bandwidth the partition-protected cores need).
         // The trial itself decides whether throttling helps the system.
         for (uint32_t k = 0; k < 2; k++) {
-            const double *m = ((rank_turn + k) % 2 == 0) ? cost_ewma : traf_ewma;
+            const bool useless_rank = ((rank_turn + k) % 2 == 0);
+            double m[NUM_CPUS];
+            for (uint32_t i = 0; i < NUM_CPUS; i++)            // bandwidth hogs: prefer cores UCP gave few ways
+                m[i] = useless_rank ? cost_ewma[i] : traf_ewma[i] * (avgw / (ways[i] > 1.0 ? ways[i] : 1.0));
             double total = 0.0;
             int j = -1;
             for (uint32_t i = 0; i < NUM_CPUS; i++) {
@@ -248,7 +258,7 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
                     j = (int)i;
             }
             if (j >= 0 && total > 0 && m[j] >= vp.share * total / NUM_CPUS) {
-                const bool useless = m == cost_ewma;
+                const bool useless = useless_rank;
                 rank_turn++;
                 start_trial(j, -1, useless ? "pressure/useless-traffic" : "pressure/bandwidth-hog", bwavg);
                 return;
@@ -340,6 +350,10 @@ void coord_init()
         num("COORD_V_BW", vp.bw_hi);
         num("COORD_V_GAIN", vp.gain);
         num("COORD_V_SHARE", vp.share);
+        if (const char *e = std::getenv("COORD_V_PART"))
+            vp.part = *e == '1';
+        if (vp.part && !ucp_quota_of)
+            die("COORD_V_PART=1 needs the ucp LLC replacement policy");
         cnt("COORD_V_TRIAL", vp.trial);
         cnt("COORD_V_COOLDOWN", vp.cooldown);
         cnt("COORD_V_CALM", vp.calm);
@@ -399,8 +413,8 @@ void coord_arm()
                 policy == POLICY_STATIC ? "static" : policy == POLICY_VICTIM ? "victim" : "log",
                 (unsigned long long)epoch_cycles, (unsigned)NUM_CPUS, (unsigned long long)next_epoch);
     if (policy == POLICY_VICTIM)
-        std::printf("[COORD] victim: bw>=%.2f gain=%.4f share=%.2f trial=%u cooldown=%u calm=%u retest=%u\n",
-                    vp.bw_hi, vp.gain, vp.share, vp.trial, vp.cooldown, vp.calm, vp.retest);
+        std::printf("[COORD] victim: bw>=%.2f gain=%.4f share=%.2f trial=%u cooldown=%u calm=%u retest=%u part=%d\n",
+                    vp.bw_hi, vp.gain, vp.share, vp.trial, vp.cooldown, vp.calm, vp.retest, (int)vp.part);
 }
 
 void coord_tick()
