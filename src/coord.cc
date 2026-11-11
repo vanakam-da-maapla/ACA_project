@@ -63,7 +63,9 @@ double   bw_acc = 0.0;                    // sum of the DRAM bandwidth level ove
 uint64_t bw_n = 0;
 bool     ref_ok = false;
 double   ref_ipc[NUM_CPUS];               // recent IPC of every core (EWMA over epochs without a trial)
-double   cost_ewma[NUM_CPUS];             // useless prefetch DRAM reads per kilo-cycle (EWMA)
+double   cost_ewma[NUM_CPUS];             // useless prefetch DRAM reads per kilo-cycle (EWMA): self-harm suspects
+double   traf_ewma[NUM_CPUS];             // all prefetch DRAM reads per kilo-cycle (EWMA): bandwidth hogs (neighbour harm)
+uint32_t rank_turn = 0;                   // alternates the two candidate rankings
 double   acc_ewma[NUM_CPUS];              // prefetch accuracy (EWMA)
 uint32_t cooldown_left[NUM_CPUS];
 bool     in_trial = false;
@@ -160,9 +162,9 @@ void start_trial(int j, int dir, const char *why, double bwavg)
     trial_n = 0;
     trial_score = trial_self = 0.0;
     update_gate();
-    std::printf("COORD_V e=%llu trial core=%d %s to level %u (%s, bw=%.2f, cost=%.3f, acc=%.3f)\n",
+    std::printf("COORD_V e=%llu trial core=%d %s to level %u (%s, bw=%.2f, useless=%.3f, traffic=%.3f, acc=%.3f)\n",
                 (unsigned long long)epoch_index, j, dir < 0 ? "down" : "up", (unsigned)level[j], why, bwavg,
-                cost_ewma[j], acc_ewma[j]);
+                cost_ewma[j], traf_ewma[j], acc_ewma[j]);
 }
 
 // One decision step at the end of an epoch (deltas between o and n).
@@ -176,9 +178,11 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
         const double use = (double)(a.l1d.useful - b.l1d.useful + a.l2c.useful - b.l2c.useful);
         const double unu = (double)(a.l1d.useless - b.l1d.useless + a.l2c.useless - b.l2c.useless);
         const double acc = use + unu > 0 ? use / (use + unu) : 1.0;
-        const double cost = (double)(a.llc_pfmiss - b.llc_pfmiss) * (1.0 - acc) * 1000.0 / (double)epoch_cycles;
+        const double traf = (double)(a.llc_pfmiss - b.llc_pfmiss) * 1000.0 / (double)epoch_cycles;
+        const double cost = traf * (1.0 - acc);
         if (level[i] == COORD_LEVELS - 1 || !ref_ok) {        // judge a core by its unthrottled behaviour
             cost_ewma[i] = ref_ok ? vp.alpha * cost + (1 - vp.alpha) * cost_ewma[i] : cost;
+            traf_ewma[i] = ref_ok ? vp.alpha * traf + (1 - vp.alpha) * traf_ewma[i] : traf;
             if (use + unu > 0)
                 acc_ewma[i] = ref_ok ? vp.alpha * acc + (1 - vp.alpha) * acc_ewma[i] : acc;
         }
@@ -229,17 +233,26 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
             cooldown_left[i]--;
     }
     since_retest++;
-    if (bwavg >= vp.bw_hi) {                                   // pressure: try the most wasteful prefetcher
-        double total = 0.0;
-        int j = -1;
-        for (uint32_t i = 0; i < NUM_CPUS; i++) {
-            total += cost_ewma[i];
-            if (level[i] > 0 && !cooldown_left[i] && (j < 0 || cost_ewma[i] > cost_ewma[j]))
-                j = (int)i;
-        }
-        if (j >= 0 && total > 0 && cost_ewma[j] >= vp.share * total / NUM_CPUS) {
-            start_trial(j, -1, "pressure", bwavg);
-            return;
+    if (bwavg >= vp.bw_hi) {
+        // Pressure: two kinds of suspects, tried in turn -- (a) self-harm: most USELESS prefetch DRAM traffic
+        // (inaccurate prefetchers, e.g. IPCP on irregular cache-sensitive code); (b) neighbour harm: most prefetch
+        // DRAM traffic of any kind (accurate streamers that eat the bandwidth the partition-protected cores need).
+        // The trial itself decides whether throttling helps the system.
+        for (uint32_t k = 0; k < 2; k++) {
+            const double *m = ((rank_turn + k) % 2 == 0) ? cost_ewma : traf_ewma;
+            double total = 0.0;
+            int j = -1;
+            for (uint32_t i = 0; i < NUM_CPUS; i++) {
+                total += m[i];
+                if (level[i] > 0 && !cooldown_left[i] && (j < 0 || m[i] > m[j]))
+                    j = (int)i;
+            }
+            if (j >= 0 && total > 0 && m[j] >= vp.share * total / NUM_CPUS) {
+                const bool useless = m == cost_ewma;
+                rank_turn++;
+                start_trial(j, -1, useless ? "pressure/useless-traffic" : "pressure/bandwidth-hog", bwavg);
+                return;
+            }
         }
     }
     int up = -1;                                               // calm, or time to re-test: give one level back

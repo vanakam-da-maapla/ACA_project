@@ -2,6 +2,9 @@
 """
 eval_coord.py -- evaluate the coordination controller (COORD_POLICY=victim, src/coord.cc) against independent operation
 =======================================================================================================================
+Set-ups: 4core (normal bandwidth, oracle mixes), 4core_lowbw (same mixes, 2.4 GB/s per core like the 8-core
+low-bandwidth runs; base and ref are simulated here), 8core (low bandwidth, the 8 mixes with the most casualties).
+All binaries are built and run with the name suffix -coord (--bin-tag), so a running study is never disturbed.
 Compares, per mix and per prefetcher:
     base   UCP + native prefetcher (independent operation)
     coord  UCP + prefetcher + the controller (one or more parameter variants)
@@ -18,7 +21,7 @@ ONE COMMAND (repository root):
     python3 scripts/eval_coord.py --report-only        # workbook from the logs already there
 Variants: --variant NAME=KNOBS adds a controller variant, KNOBS = runner knobs, e.g.
     --variant gain1pct=+cv=V_GAIN:0.01   --variant fast=+cv=EPOCH_CYCLES:500000
-(default: one variant 'victim' with the default parameters).  Outputs: eval_results/eval_report.xlsx, eval_*.csv.
+(default: one variant 'vpt' = the controller with its default parameters).  Outputs: eval_results/eval_report.xlsx, eval_*.csv.
 """
 import argparse
 import csv
@@ -41,7 +44,11 @@ RUNNER = "scripts/run_4core_mixes_fixingKnob.py"
 PFS = {"pythia": "ucp_pythia", "ipcp": "ucp_ipcp"}
 SETUPS = {
     "4core": dict(cores=4, sets=2048, ways=16, warm=25, sim=100, bw="", mixes=[1, 3, 5, 7, 9, 12, 13, 16, 17, 19, 24, 28, 33, 49]),
-    "8core": dict(cores=8, sets=4096, ways=16, warm=25, sim=150, bw="+bw=1200", mixes=list(range(1, 21))),
+    # 4 cores with the per-core DRAM bandwidth of the 8-core low-bandwidth runs (2 channels at 600 MT/s = 2.4 GB/s/core)
+    "4core_lowbw": dict(cores=4, sets=2048, ways=16, warm=25, sim=100, bw="+bw=600",
+                        mixes=[1, 3, 5, 7, 9, 12, 13, 16, 17, 19, 24, 28, 33, 49]),
+    # default: the 8 low-bandwidth 8-core mixes with the most casualty cores (02 14 16 15 09 11 20 06)
+    "8core": dict(cores=8, sets=4096, ways=16, warm=25, sim=150, bw="+bw=1200", mixes=[2, 6, 9, 11, 14, 15, 16, 20]),
 }
 LOCK = threading.Lock()
 
@@ -98,11 +105,12 @@ def main():
     here = Path(__file__).resolve().parent
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1], formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument("--root", type=Path, default=here.parent if here.name == "scripts" else Path.cwd())
-    ap.add_argument("--setups", default="4core,8core")
+    ap.add_argument("--setups", default="4core,4core_lowbw")
     ap.add_argument("--prefetchers", default="pythia,ipcp")
     ap.add_argument("--variant", action="append", default=[], help="NAME=KNOBS, e.g. gain1pct=+cv=V_GAIN:0.01")
     ap.add_argument("--mixes-4core", default=None, help="override the 4-core mix ids")
     ap.add_argument("--mixes-8core", default=None, help="override the 8-core mix ids")
+    ap.add_argument("--bin-tag", default="coord", help="binary name suffix for every build and run")
     ap.add_argument("--oracle-dir", type=Path, default=None, help="default <root>/oracle_results")
     ap.add_argument("--scaleup-dir", type=Path, default=None, help="default <root>/scaleup_8core_results")
     ap.add_argument("--out", type=Path, default=None, help="default <root>/eval_results")
@@ -122,11 +130,13 @@ def main():
     odir = (a.oracle_dir or root / "oracle_results").resolve()
     sdir = (a.scaleup_dir or root / "scaleup_8core_results").resolve()
     out = (a.out or root / "eval_results").resolve()
-    variants = [("victim", "+coord=victim")] + [(v.split("=", 1)[0], "+coord=victim" + v.split("=", 1)[1]) for v in a.variant]
+    variants = [("vpt", "+coord=victim")] + [(v.split("=", 1)[0], "+coord=victim" + v.split("=", 1)[1]) for v in a.variant]
     pfs = [p for p in a.prefetchers.split(",") if p]
     setups = [s for s in a.setups.split(",") if s]
     if a.mixes_4core:
         SETUPS["4core"]["mixes"] = [int(x) for x in a.mixes_4core.split(",")]
+    if a.mixes_4core:
+        SETUPS["4core_lowbw"]["mixes"] = SETUPS["4core"]["mixes"]
     if a.mixes_8core:
         SETUPS["8core"]["mixes"] = [int(x) for x in a.mixes_8core.split(",")]
     mixcsv8 = sdir / "mixes_8core.csv"
@@ -142,6 +152,9 @@ def main():
                 if s == "4core":
                     base_d = odir / p / "final_25+100M" / ("mix%02d" % m) / "wucp_d6-6-6-6"
                     ref_d = odir / "common" / "final_25+100M" / ("mix%02d" % m) / "lru_nopf"
+                elif s == "4core_lowbw":                        # nothing to re-use: simulated here
+                    base_d = out / s / p / "base" / ("mix%02d" % m)
+                    ref_d = out / s / "common" / "ref" / ("mix%02d" % m)
                 else:
                     base_d = sdir / "tier1" / ("ucp_%s_bw1200" % p) / ("mix%02d" % m)
                     ref_d = sdir / "tier1" / "lru_nopf_bw1200" / ("mix%02d" % m)
@@ -166,7 +179,7 @@ def main():
                 if pl["complete"] and pl["sim"] == S["sim"] * 1e6 and pl["sets"] == S["sets"]:   # same length and LLC
                     j.log = find_log(d)
                     break
-        if j.log is None and (j.role in ("base", "ref") and not a.run_missing):
+        if j.log is None and (j.role in ("base", "ref") and not a.run_missing and j.setup != "4core_lowbw"):
             continue
         if j.log is None:
             todo.append(j)
@@ -186,7 +199,8 @@ def main():
         d.mkdir(parents=True, exist_ok=True)
         cmd = [sys.executable, str(root / RUNNER), "--root", str(root), "--experiment", j.spec, "--only", str(j.mix),
                "--warmup", str(S["warm"]), "--sim", str(S["sim"]), "--llc-sets", str(S["sets"]), "--llc-ways", str(S["ways"]),
-               "--results-dir", str(d), "--jobs", "1", "--no-verify"] + (["--repl", "lru"] if j.lru else []) + a.runner_args
+               "--results-dir", str(d), "--jobs", "1", "--no-verify", "--bin-tag", a.bin_tag] \
+            + (["--repl", "lru"] if j.lru else []) + a.runner_args
         if S["cores"] != 4:
             cmd += ["--cores", str(S["cores"]), "--mixes-csv", str(mixcsv8)]
         t0 = time.time()
@@ -210,7 +224,7 @@ def main():
                 specs = sorted({PFS[p] for p in pfs} | {"plain"})
                 cmd = [sys.executable, str(root / RUNNER), "--root", str(root), "--experiment", ",".join(specs),
                        "--repl", "lru", "--llc-sets", str(S["sets"]), "--llc-ways", str(S["ways"]), "--build",
-                       "--build-only"] + a.runner_args
+                       "--build-only", "--bin-tag", a.bin_tag] + a.runner_args
                 if S["cores"] != 4:
                     cmd += ["--cores", str(S["cores"]), "--mixes-csv", str(mixcsv8)]
                 say("building %s binaries" % s)
@@ -308,8 +322,9 @@ def report(jobs, variants, pfs, setups, odir, out):
     out.mkdir(parents=True, exist_ok=True)
     for name, data in (("summary", summ), ("mix", mixrows), ("core", corerows)):
         if data:
+            keys = list(dict.fromkeys(k for d in data for k in d))
             with open(out / ("eval_%s.csv" % name), "w", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=list(data[0].keys()))
+                w = csv.DictWriter(f, fieldnames=keys, restval="")
                 w.writeheader()
                 w.writerows(data)
     try:
@@ -327,7 +342,7 @@ def report(jobs, variants, pfs, setups, odir, out):
             ws.append([note])
             ws["A1"].font = Font(bold=True)
             if data:
-                hdr = list(data[0].keys())
+                hdr = list(dict.fromkeys(k for d in data for k in d))
                 ws.append(hdr)
                 for c in ws[2]:
                     c.font = Font(bold=True)

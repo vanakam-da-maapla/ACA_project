@@ -706,8 +706,9 @@ def binary_name(args):
     """The knob binary (built only when an experiment uses +ways / +deg) has the suffix -knob; everything else runs on the
     original binary of its LLC policy."""
     l1d, l2c = PREFETCHER_FILES[getattr(args, "mode", None) or "pythia"]
-    return "%s-%s-%s-no-%s-%dcore-llc%ds%dw%s" % (args.bp, l1d, l2c, args.repl, NCORES, args.llc_sets, args.llc_ways,
-                                                  "-knob" if getattr(args, "needs_knob", False) else "")
+    return "%s-%s-%s-no-%s-%dcore-llc%ds%dw%s%s" % (args.bp, l1d, l2c, args.repl, NCORES, args.llc_sets, args.llc_ways,
+                                                    "-knob" if getattr(args, "needs_knob", False) else "",
+                                                    "-" + args.bin_tag if getattr(args, "bin_tag", None) else "")
 
 
 SRC_ITEMS = ("Makefile", "build_champsim.sh", "src", "inc", "branch", "prefetcher", "replacement", "config")
@@ -1315,6 +1316,8 @@ def main():
     b.add_argument("--include-untracked", action="store_true",
                    help="--build: also copy untracked source files (default: tracked files only, like a clean clone)")
     b.add_argument("--keep-build-dir", action="store_true", help="keep the temporary build directory")
+    b.add_argument("--bin-tag", default=None, help="suffix of the binary names (build and run), e.g. 'coord', so that "
+                   "new builds never overwrite binaries that running simulations are using")
     b.add_argument("--no-occupancy", action="store_true",
                    help="--build: do NOT add the LLC-occupancy statistics (by default the build adds read-only sampling "
                         "that prints the LLC blocks owned by each core; it does not change any simulated result)")

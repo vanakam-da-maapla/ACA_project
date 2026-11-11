@@ -11,8 +11,10 @@
 //                                 each >= 1). Needs the ucp LLC replacement. UCP's own repartition timer is
 //                                 switched off. If unset, UCP keeps allocating by itself.
 //   victim  victim-aware, partition-aware prefetch throttling (VPT).  UCP keeps partitioning the LLC; every epoch
-//           the controller looks at DRAM pressure and at each core's useless prefetch traffic.  Under pressure it
-//           TRIES throttling the core whose prefetches cost the most DRAM bandwidth for the least benefit (one level
+//           the controller looks at DRAM pressure and at each core's prefetch DRAM traffic.  Under pressure it
+//           TRIES throttling, in turn, the core with the most USELESS prefetch traffic (self-harm, e.g. inaccurate
+//           IPCP on irregular code) and the core with the most prefetch traffic of any kind (bandwidth hog that
+//           hurts its neighbours, e.g. an accurate streamer next to cache-sensitive cores) (one level
 //           down for COORD_V_TRIAL epochs) and KEEPS the change only if the harmonic mean of every core's IPC
 //           relative to its recent IPC improves by COORD_V_GAIN -- i.e. only if the other cores (the victims the
 //           partition is protecting) gain more than the throttled core loses.  When DRAM is calm, or every
