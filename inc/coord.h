@@ -32,6 +32,9 @@
 //                           core by 1 + ways/average ways, so cores UCP protects as cache-sensitive count more;
 //                           (2) the bandwidth-hog ranking scales prefetch traffic by average ways / ways, so cores
 //                           UCP gives few ways (little cache benefit, typically streamers) are suspected first
+//           COORD_V_BWLO    DRAM counts as calm only below this level (hysteresis; default: below COORD_V_BW)
+//           COORD_V_UPGAIN  an up-trial is kept if the score >= 1 + this (default -COORD_V_GAIN/2)
+//           COORD_V_SCORE   hm (default: harmonic mean, fairness-aware) or am (arithmetic mean, throughput)
 //
 // Environment:
 //   COORD_EPOCH_CYCLES  epoch length in uncore cycles (default 1000000)

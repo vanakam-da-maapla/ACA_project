@@ -57,6 +57,9 @@ bool quiet = false;
 struct VParams {
     double   bw_hi = 1.5, gain = 0.005, share = 0.5, alpha = 0.3;
     bool     part = false;                // COORD_V_PART=1: use UCP's way allocation (see coord.h)
+    double   bw_lo = -1.0;                // COORD_V_BWLO: DRAM is "calm" below this (default: below bw_hi)
+    double   upgain = -1.0;               // COORD_V_UPGAIN: keep an up-trial if score >= 1 + upgain (default -gain/2)
+    bool     score_am = false;            // COORD_V_SCORE=am: arithmetic mean (throughput) instead of harmonic
     uint32_t trial = 2, cooldown = 16, calm = 4, retest = 32;
 };
 VParams  vp;
@@ -189,7 +192,7 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
         }
         level_epochs[i][level[i]]++;
     }
-    calm_epochs = bwavg >= vp.bw_hi ? 0 : calm_epochs + 1;
+    calm_epochs = bwavg >= (vp.bw_lo >= 0 ? vp.bw_lo : vp.bw_hi) ? 0 : calm_epochs + 1;
     if (!ref_ok) {
         for (uint32_t i = 0; i < NUM_CPUS; i++)
             ref_ipc[i] = ipc[i];
@@ -205,16 +208,17 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
         for (uint32_t i = 0; i < NUM_CPUS; i++) {
             const double r = ref_ipc[i] > 0 ? ipc[i] / ref_ipc[i] : 1.0;
             const double w = vp.part ? 1.0 + ways[i] / avgw : 1.0;   // cores UCP protects count more
-            inv += w / (r > 1e-3 ? r : 1e-3);
+            inv += vp.score_am ? w * r : w / (r > 1e-3 ? r : 1e-3);
             wsum += w;
         }
-        trial_score += wsum / inv;                            // (weighted) harmonic mean: throughput that respects fairness
+        trial_score += vp.score_am ? inv / wsum : wsum / inv;  // (weighted) harmonic mean (fairness) or arithmetic
         trial_self += ref_ipc[trial_core] > 0 ? ipc[trial_core] / ref_ipc[trial_core] : 1.0;
         trial_n++;
         if (--trial_left > 0)
             return;
         const double score = trial_score / trial_n, self = trial_self / trial_n;
-        const bool ok = trial_dir < 0 ? score >= 1.0 + vp.gain : score >= 1.0 - vp.gain / 2;
+        const bool ok = trial_dir < 0 ? score >= 1.0 + vp.gain
+                                       : score >= 1.0 + (vp.upgain > -0.5 ? vp.upgain : -vp.gain / 2);
         const int j = trial_core;
         if (ok) {
             (trial_dir < 0 ? n_down_ok : n_up_ok)++;
@@ -352,6 +356,10 @@ void coord_init()
         num("COORD_V_SHARE", vp.share);
         if (const char *e = std::getenv("COORD_V_PART"))
             vp.part = *e == '1';
+        num("COORD_V_BWLO", vp.bw_lo);
+        num("COORD_V_UPGAIN", vp.upgain);
+        if (const char *e = std::getenv("COORD_V_SCORE"))
+            vp.score_am = !std::strcmp(e, "am");
         if (vp.part && !ucp_quota_of)
             die("COORD_V_PART=1 needs the ucp LLC replacement policy");
         cnt("COORD_V_TRIAL", vp.trial);
@@ -413,8 +421,9 @@ void coord_arm()
                 policy == POLICY_STATIC ? "static" : policy == POLICY_VICTIM ? "victim" : "log",
                 (unsigned long long)epoch_cycles, (unsigned)NUM_CPUS, (unsigned long long)next_epoch);
     if (policy == POLICY_VICTIM)
-        std::printf("[COORD] victim: bw>=%.2f gain=%.4f share=%.2f trial=%u cooldown=%u calm=%u retest=%u part=%d\n",
-                    vp.bw_hi, vp.gain, vp.share, vp.trial, vp.cooldown, vp.calm, vp.retest, (int)vp.part);
+        std::printf("[COORD] victim: bw>=%.2f gain=%.4f share=%.2f trial=%u cooldown=%u calm=%u retest=%u part=%d "
+                    "bwlo=%.2f upgain=%.4f score=%s\n", vp.bw_hi, vp.gain, vp.share, vp.trial, vp.cooldown, vp.calm,
+                    vp.retest, (int)vp.part, vp.bw_lo, vp.upgain, vp.score_am ? "am" : "hm");
 }
 
 void coord_tick()
