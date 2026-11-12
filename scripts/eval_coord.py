@@ -265,6 +265,12 @@ def report(jobs, variants, pfs, setups, odir, out):
     for j in jobs:
         if j.log:
             by[(j.setup, j.pf, j.mix)][j.role] = parse(j.log, SETUPS[j.setup]["cores"])
+    # the no-prefetcher reference is the same run for every prefetcher of a mix: share it
+    for (s_, p_, m_), R in list(by.items()):
+        if "ref" in R:
+            for p2 in PFS:
+                if (s_, p2, m_) in by and "ref" not in by[(s_, p2, m_)]:
+                    by[(s_, p2, m_)]["ref"] = R["ref"]
     oracle = {}
     oc = odir / "oracle_runs.csv"
     if oc.is_file():
