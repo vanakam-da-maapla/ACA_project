@@ -40,6 +40,12 @@ uint64_t partition_number = 0;
 bool external_control = false;   // true: the coordination controller owns the quotas, UCP's own timer is off
 bool started_roi_schedule = false;
 
+// Utility monitor split by request type, for the coordination controller (src/coord.cc).  Counted in the same
+// sampled shadow tags as hit_counter (identical hits), but kept apart: [0] = demand (load/RFO/...), [1] = prefetch.
+// UCP's own allocation never reads these; the controller reads and ages them (ucp_umon_hits / ucp_umon_decay).
+uint64_t co_hits[NUM_CPUS][2][LLC_WAY] = {};
+uint32_t cur_type = 0;           // type of the access being sampled (set just before sample_access)
+
 void verify_set(uint32_t set)
 {
     uint32_t sum = 0;
@@ -123,8 +129,10 @@ void sample_access(uint32_t cpu, uint64_t full_addr, uint32_t set)
         if (atd[cpu][set][way].valid && atd[cpu][set][way].address == address)
             break;
     if (way < LLC_WAY) {
-        if (warmup_complete[cpu])
+        if (warmup_complete[cpu]) {
             ++hit_counter[cpu][atd[cpu][set][way].lru];
+            ++co_hits[cpu][cur_type == PREFETCH ? 1 : 0][atd[cpu][set][way].lru];
+        }
     } else {
         for (way = 0; way < LLC_WAY; ++way)
             if (!atd[cpu][set][way].valid)
@@ -325,6 +333,7 @@ void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     assert(set < LLC_SET && cpu < NUM_CPUS);
     if (hit && type == WRITEBACK)
         return;
+    cur_type = type;
 
     sample_access(cpu, full_addr, set);
     maybe_partition(this);
@@ -382,4 +391,23 @@ bool ucp_set_quota(const uint32_t *q)
         std::printf(" CPU%u=%u", c, quota[c]);
     std::printf("\n");
     return true;
+}
+
+// Used by the coordination controller: per-LRU-position shadow-tag hits of a core since the last decay,
+// split into demand hits (dm) and prefetch-request hits (pf).  Arrays of LLC_WAY entries.
+void ucp_umon_hits(uint32_t cpu, uint64_t *dm, uint64_t *pf)
+{
+    for (uint32_t r = 0; r < LLC_WAY; ++r) {
+        dm[r] = co_hits[cpu][0][r];
+        pf[r] = co_hits[cpu][1][r];
+    }
+}
+
+// Age the split counters (halve), as UCP does with its own counters after each allocation.
+void ucp_umon_decay()
+{
+    for (uint32_t c = 0; c < NUM_CPUS; ++c)
+        for (uint32_t t = 0; t < 2; ++t)
+            for (uint32_t r = 0; r < LLC_WAY; ++r)
+                co_hits[c][t][r] /= 2;
 }

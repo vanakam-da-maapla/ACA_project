@@ -12,6 +12,8 @@
 extern uint32_t ucp_quota_of(uint32_t cpu) __attribute__((weak));
 extern void ucp_set_external_control(bool on) __attribute__((weak));
 extern bool ucp_set_quota(const uint32_t *q) __attribute__((weak));
+extern void ucp_umon_hits(uint32_t cpu, uint64_t *dm, uint64_t *pf) __attribute__((weak));
+extern void ucp_umon_decay() __attribute__((weak));
 
 bool coord_armed = false;
 bool coord_gate_active = false;
@@ -61,6 +63,13 @@ struct VParams {
     double   upgain = -1.0;               // COORD_V_UPGAIN: keep an up-trial if score >= 1 + upgain (default -gain/2)
     bool     score_am = false;            // COORD_V_SCORE=am: arithmetic mean (throughput) instead of harmonic
     uint32_t trial = 2, cooldown = 16, calm = 4, retest = 32;
+    // ---- two-way coordination (see coord.h): the controller also owns the LLC partition
+    uint32_t ways = 0;                    // COORD_V_WAYS: 0 = UCP partitions by itself, 1 = accuracy-weighted utility,
+                                          //               2 = UCP's own utility (demand + prefetch hits), both trialled
+    bool     snap = false;                // COORD_V_SNAP=1: throttle prefetch-inflated way gainers, restore last-good state
+    uint32_t wperiod = 5, wtrial = 2, wcool = 3;
+    double   wtol = -9.0;                 // a repartition is kept unless the score drops below 1 - wtol (default gain)
+    double   acc_lo = 0.4;                // prefetch accuracy below which a core's way gain counts as prefetch-inflated
 };
 VParams  vp;
 double   bw_acc = 0.0;                    // sum of the DRAM bandwidth level over the cycles of the epoch
@@ -79,6 +88,21 @@ double   trial_score = 0.0, trial_self = 0.0;
 uint32_t calm_epochs = 0, since_retest = 0;
 uint64_t n_down_ok = 0, n_down_rej = 0, n_up_ok = 0, n_up_rej = 0;
 uint64_t level_epochs[NUM_CPUS][COORD_LEVELS];
+
+// two-way coordination state
+enum TrialKind { T_PF = 0, T_WAYS = 1 };
+TrialKind trial_kind = T_PF;
+bool     trial_rollback = false;          // the running prefetch trial throttles a prefetch-inflated way gainer
+uint32_t cur_q[NUM_CPUS], prev_q[NUM_CPUS], rej_q[NUM_CPUS];
+bool     rej_valid = false;
+uint32_t wcool_left = 0, since_part = 0;
+double   ref_before[NUM_CPUS];            // reference IPC before a way trial (restored when the trial is reverted)
+int      pending_gainer = -1;
+uint8_t  good_level[NUM_CPUS];            // last-good snapshot: prefetch levels and way allocation
+uint32_t good_q[NUM_CPUS];
+bool     good_valid = false;
+uint64_t n_w_ok = 0, n_w_rej = 0, n_w_same = 0, n_gainer = 0, n_restore = 0;
+uint64_t quota_epochs[NUM_CPUS];
 
 PfCounters read_pf(const CACHE &c)
 {
@@ -160,6 +184,7 @@ void start_trial(int j, int dir, const char *why, double bwavg)
 {
     level[j] = (uint8_t)((int)level[j] + dir);
     in_trial = true;
+    trial_kind = T_PF;
     trial_core = j;
     trial_dir = dir;
     trial_left = vp.trial;
@@ -169,6 +194,131 @@ void start_trial(int j, int dir, const char *why, double bwavg)
     std::printf("COORD_V e=%llu trial core=%d %s to level %u (%s, bw=%.2f, useless=%.3f, traffic=%.3f, acc=%.3f)\n",
                 (unsigned long long)epoch_index, j, dir < 0 ? "down" : "up", (unsigned)level[j], why, bwavg,
                 cost_ewma[j], traf_ewma[j], acc_ewma[j]);
+}
+
+bool same_q(const uint32_t *a, const uint32_t *b)
+{
+    for (uint32_t i = 0; i < NUM_CPUS; i++)
+        if (a[i] != b[i])
+            return false;
+    return true;
+}
+
+void install_q(const uint32_t *q)
+{
+    if (!ucp_set_quota(q))
+        die("ucp rejected a controller way allocation");
+    for (uint32_t i = 0; i < NUM_CPUS; i++)
+        cur_q[i] = q[i];
+}
+
+void save_good()
+{
+    for (uint32_t i = 0; i < NUM_CPUS; i++) {
+        good_level[i] = level[i];
+        good_q[i] = cur_q[i];
+    }
+    good_valid = true;
+}
+
+// UCP's greedy lookahead allocation (one guaranteed way per core) on a given utility curve u[c][r] = hits at LRU
+// position r.  Same algorithm as replacement/ucp.llc_repl, so with u = demand + prefetch hits it reproduces UCP.
+void lookahead(double u[NUM_CPUS][LLC_WAY], uint32_t *q)
+{
+    uint32_t balance = LLC_WAY - NUM_CPUS;
+    for (uint32_t c = 0; c < NUM_CPUS; c++)
+        q[c] = 1;
+    while (balance) {
+        uint32_t winner = 0, requested = 0;
+        double best_global = 0;
+        for (uint32_t c = 0; c < NUM_CPUS; c++) {
+            double total = 0, best_local = 0;
+            uint32_t best_ways = 0;
+            for (uint32_t w = q[c] + 1; w <= q[c] + balance; w++) {
+                total += u[c][w - 1];
+                const double marginal = total / (w - q[c]);
+                if (marginal > best_local) {
+                    best_local = marginal;
+                    best_ways = w;
+                }
+            }
+            if (best_local > best_global) {
+                best_global = best_local;
+                winner = c;
+                requested = best_ways;
+            }
+        }
+        if (requested <= q[winner])
+            break;
+        balance -= requested - q[winner];
+        q[winner] = requested;
+    }
+    while (balance) {
+        uint32_t least = 0;
+        for (uint32_t c = 1; c < NUM_CPUS; c++)
+            if (q[c] < q[least])
+                least = c;
+        ++q[least];
+        --balance;
+    }
+}
+
+// Weighted harmonic (or arithmetic) mean of the cores' IPC relative to ref_ipc; weights 1 + ways/avg (V_PART).
+double score_of(const double *ipc, const double *ways, double avgw)
+{
+    double inv = 0.0, wsum = 0.0;
+    for (uint32_t i = 0; i < NUM_CPUS; i++) {
+        const double r = ref_ipc[i] > 0 ? ipc[i] / ref_ipc[i] : 1.0;
+        const double w = vp.part ? 1.0 + ways[i] / avgw : 1.0;
+        inv += vp.score_am ? w * r : w / (r > 1e-3 ? r : 1e-3);
+        wsum += w;
+    }
+    return vp.score_am ? inv / wsum : wsum / inv;
+}
+
+// Partition step (every COORD_V_WPERIOD epochs outside trials): the controller's own allocation from the split
+// utility monitor.  Mode 1 counts a core's prefetch-request hits in proportion to its prefetch accuracy, so an
+// inaccurate prefetcher cannot inflate its core's utility and take ways from cache-sensitive neighbours.
+// A changed allocation is installed as a trial and kept only if the system score does not drop.
+bool ways_step(double bwavg)
+{
+    double u[NUM_CPUS][LLC_WAY];
+    for (uint32_t c = 0; c < NUM_CPUS; c++) {
+        uint64_t dm[LLC_WAY], pf[LLC_WAY];
+        ucp_umon_hits(c, dm, pf);
+        const double a = vp.ways == 1 ? (acc_ewma[c] < 0 ? 0 : acc_ewma[c] > 1 ? 1 : acc_ewma[c]) : 1.0;
+        for (uint32_t r = 0; r < LLC_WAY; r++)
+            u[c][r] = (double)dm[r] + a * (double)pf[r];
+    }
+    ucp_umon_decay();
+    uint32_t q[NUM_CPUS];
+    lookahead(u, q);
+    if (wcool_left)
+        wcool_left--;
+    if (same_q(q, cur_q)) {
+        n_w_same++;
+        return false;
+    }
+    if (rej_valid && wcool_left && same_q(q, rej_q))
+        return false;
+    for (uint32_t i = 0; i < NUM_CPUS; i++) {
+        prev_q[i] = cur_q[i];
+        ref_before[i] = ref_ipc[i];
+    }
+    install_q(q);
+    in_trial = true;
+    trial_kind = T_WAYS;
+    trial_left = vp.wtrial;
+    trial_n = 0;
+    trial_score = 0.0;
+    std::printf("COORD_W e=%llu trial ways", (unsigned long long)epoch_index);
+    for (uint32_t i = 0; i < NUM_CPUS; i++)
+        std::printf("%s%u", i ? "-" : " ", prev_q[i]);
+    std::printf(" ->");
+    for (uint32_t i = 0; i < NUM_CPUS; i++)
+        std::printf("%s%u", i ? "-" : " ", q[i]);
+    std::printf(" (bw=%.2f)\n", bwavg);
+    return true;
 }
 
 // One decision step at the end of an epoch (deltas between o and n).
@@ -191,7 +341,10 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
                 acc_ewma[i] = ref_ok ? vp.alpha * acc + (1 - vp.alpha) * acc_ewma[i] : acc;
         }
         level_epochs[i][level[i]]++;
+        if (vp.ways)
+            quota_epochs[i] += cur_q[i];
     }
+    since_part++;
     calm_epochs = bwavg >= (vp.bw_lo >= 0 ? vp.bw_lo : vp.bw_hi) ? 0 : calm_epochs + 1;
     if (!ref_ok) {
         for (uint32_t i = 0; i < NUM_CPUS; i++)
@@ -203,6 +356,53 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
     double ways[NUM_CPUS], avgw = (double)LLC_WAY / NUM_CPUS;
     for (uint32_t i = 0; i < NUM_CPUS; i++)
         ways[i] = (vp.part && ucp_quota_of) ? (double)ucp_quota_of(i) : avgw;
+    if (in_trial && trial_kind == T_WAYS) {
+        double pw[NUM_CPUS];
+        for (uint32_t i = 0; i < NUM_CPUS; i++)
+            pw[i] = (double)prev_q[i];                         // weights from the allocation before the trial
+        trial_score += score_of(ipc, pw, avgw);
+        trial_n++;
+        if (--trial_left > 0)
+            return;
+        const double score = trial_score / trial_n;
+        const bool ok = score >= 1.0 - (vp.wtol > -5 ? vp.wtol : vp.gain);
+        in_trial = false;
+        if (ok) {
+            n_w_ok++;
+            for (uint32_t i = 0; i < NUM_CPUS; i++)
+                ref_ipc[i] = ipc[i];
+            if (vp.snap)
+                save_good();
+            std::printf("COORD_W e=%llu keep score=%.4f\n", (unsigned long long)epoch_index, score);
+            return;
+        }
+        n_w_rej++;
+        uint32_t tried[NUM_CPUS];
+        for (uint32_t i = 0; i < NUM_CPUS; i++) {
+            tried[i] = cur_q[i];
+            rej_q[i] = cur_q[i];
+            ref_ipc[i] = ref_before[i];
+        }
+        rej_valid = true;
+        wcool_left = vp.wcool;
+        install_q(prev_q);
+        // the partition change hurt: if it gave ways to a core whose prefetcher is inaccurate, the core's utility was
+        // inflated by its own prefetches -> throttle that core next (rollback first, then the prefetch knob)
+        int g = -1;
+        double gbest = 0.0;
+        if (vp.snap)
+            for (uint32_t i = 0; i < NUM_CPUS; i++)
+                if (tried[i] > prev_q[i] && acc_ewma[i] < vp.acc_lo && level[i] > 0) {
+                    const double m = (double)(tried[i] - prev_q[i]) * (1.0 - acc_ewma[i]);
+                    if (m > gbest) {
+                        gbest = m;
+                        g = (int)i;
+                    }
+                }
+        pending_gainer = g;
+        std::printf("COORD_W e=%llu revert score=%.4f gainer=%d\n", (unsigned long long)epoch_index, score, g);
+        return;
+    }
     if (in_trial) {
         double inv = 0.0, wsum = 0.0;
         for (uint32_t i = 0; i < NUM_CPUS; i++) {
@@ -223,6 +423,8 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
         if (ok) {
             (trial_dir < 0 ? n_down_ok : n_up_ok)++;
             cooldown_left[j] = trial_dir < 0 ? vp.cooldown / 4 : 0;
+            if (vp.snap)
+                save_good();
         } else {
             (trial_dir < 0 ? n_down_rej : n_up_rej)++;
             level[j] = (uint8_t)((int)level[j] - trial_dir);
@@ -233,6 +435,22 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
                     (unsigned long long)n_down_ok, (unsigned long long)(n_down_ok + n_down_rej),
                     (unsigned long long)n_up_ok, (unsigned long long)(n_up_ok + n_up_rej));
         in_trial = false;
+        const bool restore = !ok && trial_rollback && vp.snap && good_valid;
+        trial_rollback = false;
+        if (restore) {
+            // neither the way rollback nor throttling the gainer helped: go back to the last-good joint setting
+            n_restore++;
+            for (uint32_t i = 0; i < NUM_CPUS; i++) {
+                level[i] = good_level[i];
+                cooldown_left[i] = vp.cooldown;
+            }
+            if (!same_q(good_q, cur_q))
+                install_q(good_q);
+            update_gate();
+            ref_ok = false;                                    // re-learn the reference under the restored setting
+            std::printf("COORD_W e=%llu restore last-good snapshot\n", (unsigned long long)epoch_index);
+            return;
+        }
         update_gate();
         for (uint32_t i = 0; i < NUM_CPUS; i++)               // new reference = behaviour with the decision applied
             ref_ipc[i] = ipc[i];
@@ -244,6 +462,21 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
             cooldown_left[i]--;
     }
     since_retest++;
+    if (pending_gainer >= 0) {
+        const int g = pending_gainer;
+        pending_gainer = -1;
+        if (level[g] > 0) {
+            n_gainer++;
+            start_trial(g, -1, "rollback/prefetch-inflated-utility", bwavg);
+            trial_rollback = true;
+            return;
+        }
+    }
+    if (vp.ways && since_part >= vp.wperiod) {
+        since_part = 0;
+        if (ways_step(bwavg))
+            return;
+    }
     if (bwavg >= vp.bw_hi) {
         // Pressure: two kinds of suspects, tried in turn -- (a) self-harm: most USELESS prefetch DRAM traffic
         // (inaccurate prefetchers, e.g. IPCP on irregular cache-sensitive code); (b) neighbour harm: most prefetch
@@ -335,8 +568,9 @@ void coord_init()
         std::fprintf(stderr, "[COORD] unknown COORD_POLICY '%s' (use off|log|static|victim)\n", p);
         std::exit(1);
     }
-    for (uint32_t i = 0; i < NUM_CPUS; i++)
+    for (uint32_t i = 0; i < NUM_CPUS; i++) {
         level[i] = COORD_LEVELS - 1;
+    }
     if (const char *e = std::getenv("COORD_EPOCH_CYCLES")) {
         const long long n = std::atoll(e);
         if (n <= 0) {
@@ -366,6 +600,22 @@ void coord_init()
         cnt("COORD_V_COOLDOWN", vp.cooldown);
         cnt("COORD_V_CALM", vp.calm);
         cnt("COORD_V_RETEST", vp.retest);
+        cnt("COORD_V_WAYS", vp.ways);
+        if (const char *e = std::getenv("COORD_V_SNAP"))
+            vp.snap = *e == '1';
+        cnt("COORD_V_WPERIOD", vp.wperiod);
+        cnt("COORD_V_WTRIAL", vp.wtrial);
+        cnt("COORD_V_WCOOL", vp.wcool);
+        num("COORD_V_WTOL", vp.wtol);
+        num("COORD_V_ACCLO", vp.acc_lo);
+        if (vp.ways > 2)
+            die("COORD_V_WAYS must be 0, 1 or 2");
+        if (vp.ways && (!ucp_umon_hits || !ucp_umon_decay || !ucp_set_quota || !ucp_set_external_control))
+            die("COORD_V_WAYS needs the ucp LLC replacement policy");
+        if (vp.snap && !vp.ways)
+            die("COORD_V_SNAP=1 needs COORD_V_WAYS=1 or 2");
+        if (vp.wperiod < 1 || vp.wtrial < 1)
+            die("COORD_V_WPERIOD and COORD_V_WTRIAL must be >= 1");
         if (vp.trial < 1)
             die("COORD_V_TRIAL must be >= 1");
     }
@@ -413,6 +663,14 @@ void coord_arm()
         if (!ucp_set_quota(static_ways))
             die("ucp rejected COORD_STATIC_WAYS");
     }
+    if (policy == POLICY_VICTIM && vp.ways) {
+        ucp_set_external_control(true);                        // the controller owns the partition from now on
+        for (uint32_t i = 0; i < NUM_CPUS; i++) {
+            cur_q[i] = ucp_quota_of(i);
+            acc_ewma[i] = 1.0;                                 // unknown accuracy = full credit (way mode only)
+        }
+        save_good();
+    }
     take(last_snap);
     epoch_index = 0;
     next_epoch  = uncore.cycle + epoch_cycles;
@@ -424,6 +682,10 @@ void coord_arm()
         std::printf("[COORD] victim: bw>=%.2f gain=%.4f share=%.2f trial=%u cooldown=%u calm=%u retest=%u part=%d "
                     "bwlo=%.2f upgain=%.4f score=%s\n", vp.bw_hi, vp.gain, vp.share, vp.trial, vp.cooldown, vp.calm,
                     vp.retest, (int)vp.part, vp.bw_lo, vp.upgain, vp.score_am ? "am" : "hm");
+    if (policy == POLICY_VICTIM && vp.ways)
+        std::printf("[COORD] ways: mode=%u (%s) snap=%d period=%u trial=%u cool=%u tol=%.4f acc_lo=%.2f\n", vp.ways,
+                    vp.ways == 1 ? "accuracy-weighted utility" : "UCP utility", (int)vp.snap, vp.wperiod, vp.wtrial,
+                    vp.wcool, vp.wtol > -5 ? vp.wtol : vp.gain, vp.acc_lo);
 }
 
 void coord_tick()
@@ -475,4 +737,15 @@ void coord_final_stats()
             std::printf(" %llu", (unsigned long long)level_epochs[i][l]);
         std::printf("\nCore_%u_coord_final_level %u\n", i, (unsigned)level[i]);
     }
+    if (!vp.ways)
+        return;
+    std::printf("COORD_WSUM way_trials_kept=%llu way_trials=%llu unchanged=%llu gainer_throttles=%llu restores=%llu\n",
+                (unsigned long long)n_w_ok, (unsigned long long)(n_w_ok + n_w_rej), (unsigned long long)n_w_same,
+                (unsigned long long)n_gainer, (unsigned long long)n_restore);
+    uint64_t ep = 0;
+    for (uint32_t l = 0; l < COORD_LEVELS; l++)
+        ep += level_epochs[0][l];
+    for (uint32_t i = 0; i < NUM_CPUS; i++)
+        std::printf("Core_%u_coord_avg_ways %.3f\nCore_%u_coord_final_ways %u\n", i,
+                    ep ? (double)quota_epochs[i] / (double)ep : 0.0, i, cur_q[i]);
 }

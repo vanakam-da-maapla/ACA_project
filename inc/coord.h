@@ -35,6 +35,24 @@
 //           COORD_V_BWLO    DRAM counts as calm only below this level (hysteresis; default: below COORD_V_BW)
 //           COORD_V_UPGAIN  an up-trial is kept if the score >= 1 + this (default -COORD_V_GAIN/2)
 //           COORD_V_SCORE   hm (default: harmonic mean, fairness-aware) or am (arithmetic mean, throughput)
+//   Two-way coordination (the controller also owns the LLC partition; needs the ucp LLC replacement):
+//           COORD_V_WAYS    0 (default) UCP partitions by itself.  1 or 2: UCP's own repartition timer is switched off
+//                           and every COORD_V_WPERIOD epochs (default 5 = UCP's 5M-cycle interval) the controller
+//                           computes the allocation itself with UCP's lookahead algorithm on UCP's shadow tags, whose
+//                           hits are now counted separately for demand and prefetch requests:
+//                             1 = prefetch-aware utility: demand hits + (prefetch accuracy of the core) x prefetch hits,
+//                                 so an inaccurate prefetcher cannot inflate its core's utility and take ways from
+//                                 cache-sensitive neighbours, while accurate prefetchers keep the ways they earn
+//                             2 = UCP's own utility (demand + prefetch hits; ablation of the accuracy weighting)
+//                           A changed allocation is a TRIAL like a throttle step (COORD_V_WTRIAL epochs, default 2),
+//                           one change at a time: kept unless the score drops below 1 - COORD_V_WTOL (default
+//                           COORD_V_GAIN), otherwise the previous allocation is restored and the rejected one is not
+//                           retried for COORD_V_WCOOL periods (default 3).
+//           COORD_V_SNAP=1  rollback chain (needs COORD_V_WAYS): when a reverted allocation had given ways to a core
+//                           whose prefetch accuracy is below COORD_V_ACCLO (default 0.4), the controller next tries
+//                           throttling that core (its prefetches inflated its utility).  If that is rejected as well,
+//                           the last-good joint setting (all prefetch levels + way allocation, saved after every kept
+//                           decision) is restored.
 //
 // Environment:
 //   COORD_EPOCH_CYCLES  epoch length in uncore cycles (default 1000000)

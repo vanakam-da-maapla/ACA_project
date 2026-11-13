@@ -21,7 +21,9 @@ ONE COMMAND (repository root):
     python3 scripts/eval_coord.py --report-only        # workbook from the logs already there
 Variants: --variant NAME=KNOBS adds a controller variant, KNOBS = runner knobs, e.g.
     --variant gain1pct=+cv=V_GAIN:0.01   --variant fast=+cv=EPOCH_CYCLES:500000
-(default: one variant 'vpt' = the controller with its default parameters).  Outputs: eval_results/eval_report.xlsx, eval_*.csv.
+(default: one variant 'vpt' = the controller with its default parameters).  Outputs: eval_results/eval_report_<tag>.xlsx,
+eval_<table>_<tag>.csv (--tag, default date-time); an existing report is never overwritten.  Runs of new variants go into
+their own folders (<out>/<setup>/<prefetcher>/<variant>/), completed runs are re-used, never re-simulated.
 """
 import argparse
 import csv
@@ -84,11 +86,16 @@ def parse(path, n):
                           dmiss=(g(p + r"LLC_load_miss\s+(\d+)") or 0) + (g(p + r"LLC_RFO_miss\s+(\d+)") or 0),
                           miss=g(p + r"LLC_total_miss\s+(\d+)") or 0, wbmiss=g(p + r"LLC_writeback_miss\s+(\d+)") or 0,
                           final_level=g(p + r"coord_final_level\s+(\d+)"),
+                          avg_ways=g(p + r"coord_avg_ways\s+(\S+)"),
                           lvl_epochs=[int(x) for x in (re.search(p + r"coord_epochs_at_level((?:\s+\d+)+)", t, re.M).group(1).split()
                                                        if re.search(p + r"coord_epochs_at_level", t, re.M) else [])]))
     vs = re.search(r"^COORD_VSUM (.*)$", t, re.M)
+    ws = re.search(r"^COORD_WSUM (.*)$", t, re.M)
+    uq = [[int(x) for x in re.findall(r"CPU\d+=(\d+)", q)] for q in re.findall(r"^\[UCP\] partition #\d+ .*?quotas:(.*)$", t, re.M)]
+    for c in range(n):                                  # UCP's own allocation, averaged over its repartitions
+        cores[c]["ucp_avg_ways"] = round(sum(q[c] for q in uq) / len(uq), 3) if uq and all(len(q) == n for q in uq) else None
     bw = [g(r"^DRAM_bw_level_%d\s+(\d+)" % k) for k in range(4)]
-    res = dict(cores=cores, vsum=vs.group(1) if vs else "", complete=all(c["ipc"] for c in cores),
+    res = dict(cores=cores, vsum=vs.group(1) if vs else "", wsum=ws.group(1) if ws else "", complete=all(c["ipc"] for c in cores),
                sim=g(r"^simulation_instructions\s+(\d+)"), sets=g(r"^llc_set\s+(\d+)\s*$"),
                busy50=(bw[2] + bw[3]) / sum(bw) if all(x is not None for x in bw) and sum(bw) else None)
     _PC[k] = res
@@ -119,6 +126,8 @@ def main():
     ap.add_argument("--no-build", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--report-only", action="store_true")
+    ap.add_argument("--tag", default=None, help="name of this report: eval_report_<tag>.xlsx, eval_<table>_<tag>.csv "
+                    "(default: date-time).  Existing reports are never overwritten.")
     ap.add_argument("--runner-arg", action="append", default=[], dest="runner_args")
     ap.add_argument("--test-len", default=None, help="testing only: W+S instead of the study lengths")
     a = ap.parse_args()
@@ -126,6 +135,7 @@ def main():
         w, _, sm = a.test_len.partition("+")
         for S in SETUPS.values():
             S["warm"], S["sim"] = float(w), float(sm)
+    a.tag = re.sub(r"[^A-Za-z0-9_.-]", "_", a.tag) if a.tag else datetime.now().strftime("%Y%m%d-%H%M")
     root = a.root.resolve()
     odir = (a.oracle_dir or root / "oracle_results").resolve()
     sdir = (a.scaleup_dir or root / "scaleup_8core_results").resolve()
@@ -257,10 +267,18 @@ def main():
             for p in list(procs):
                 p.send_signal(signal.SIGTERM)
             time.sleep(3)
-    report(uniq.values(), variants, pfs, setups, odir, out)
+    report(uniq.values(), variants, pfs, setups, odir, out, a.tag)
 
 
-def report(jobs, variants, pfs, setups, odir, out):
+def out_name(out, tag, stem, ext):
+    """Output file name that never overwrites an existing report: <stem>_<tag>.<ext>, plus a time stamp if taken."""
+    f = out / ("%s_%s.%s" % (stem, tag, ext))
+    if f.exists():
+        f = out / ("%s_%s_%s.%s" % (stem, tag, datetime.now().strftime("%Y%m%d-%H%M%S"), ext))
+    return f
+
+
+def report(jobs, variants, pfs, setups, odir, out, tag):
     by = defaultdict(dict)
     for j in jobs:
         if j.log:
@@ -304,13 +322,17 @@ def report(jobs, variants, pfs, setups, odir, out):
                 row["share_of_oracle_headroom"] = round((row["NWS_vs_independent"] - 1) / (ob - 1), 3) if ob > 1.005 else None
             dr = lambda x: sum(c["miss"] - c["wbmiss"] for c in x["cores"]) / (sum(c["ins"] for c in x["cores"]) / 1000)
             row.update(DRAM_RPKI_independent=round(dr(b), 3), DRAM_RPKI_coord=round(dr(v), 3),
-                       DRAM_busy50_independent=b["busy50"], DRAM_busy50_coord=v["busy50"], trials=v["vsum"])
+                       DRAM_busy50_independent=b["busy50"], DRAM_busy50_coord=v["busy50"], trials=v["vsum"],
+                       way_trials=v.get("wsum", ""))
             mixrows.append(row)
             for i in range(n):
                 corerows.append(dict(setup=s, prefetcher=p, mix=m, variant=vn, core=i, speedup_vs_independent=round(sp[i], 4),
                                      independent_vs_noPF=round(b["cores"][i]["ipc"] / ref["cores"][i]["ipc"], 4) if ref else None,
                                      coord_vs_noPF=round(v["cores"][i]["ipc"] / ref["cores"][i]["ipc"], 4) if ref else None,
                                      final_level=v["cores"][i]["final_level"],
+                                     ucp_avg_ways_independent=b["cores"][i].get("ucp_avg_ways"),
+                                     coord_avg_ways=v["cores"][i].get("avg_ways") if v["cores"][i].get("avg_ways") is not None
+                                     else v["cores"][i].get("ucp_avg_ways"),
                                      epochs_at_level_0_1_2_3=" ".join(map(str, v["cores"][i]["lvl_epochs"]))))
     for (s, p, vn) in sorted({(r["setup"], r["prefetcher"], r["variant"]) for r in mixrows}):
         R = [r for r in mixrows if (r["setup"], r["prefetcher"], r["variant"]) == (s, p, vn)]
@@ -329,7 +351,7 @@ def report(jobs, variants, pfs, setups, odir, out):
     for name, data in (("summary", summ), ("mix", mixrows), ("core", corerows)):
         if data:
             keys = list(dict.fromkeys(k for d in data for k in d))
-            with open(out / ("eval_%s.csv" % name), "w", newline="") as f:
+            with open(out_name(out, tag, "eval_%s" % name, "csv"), "w", newline="") as f:
                 w = csv.DictWriter(f, fieldnames=keys, restval="")
                 w.writeheader()
                 w.writerows(data)
@@ -354,14 +376,15 @@ def report(jobs, variants, pfs, setups, odir, out):
                     c.font = Font(bold=True)
                 for d in data:
                     ws.append([d.get(k) for k in hdr])
-        wb.save(out / "eval_report.xlsx")
+        xl = out_name(out, tag, "eval_report", "xlsx")
+        wb.save(xl)
+        say("report: %s" % xl)
     except ImportError:
         pass
     for r in summ:
         print("%(setup)s %(prefetcher)s %(variant)s: %(mixes)d mixes, geomean NWS vs independent %(geomean_NWS_vs_independent).4f, "
               "better/worse by 1%%: %(mixes_better_1pct)d/%(mixes_worse_1pct)d, casualties %(casualties_independent)d -> "
               "%(casualties_coord)d, oracle headroom captured (median) %(median_share_of_oracle_headroom)s" % r)
-    say("report: %s" % (out / "eval_report.xlsx"))
 
 
 if __name__ == "__main__":
