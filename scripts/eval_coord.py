@@ -43,6 +43,7 @@ from datetime import datetime
 from pathlib import Path
 
 RUNNER = "scripts/run_4core_mixes_fixingKnob.py"
+SWEEP_REF = "v22"          # reference variant of the parameter sweep (--sweep-ref)
 PFS = {"pythia": "ucp_pythia", "ipcp": "ucp_ipcp"}
 SETUPS = {
     "4core": dict(cores=4, sets=2048, ways=16, warm=25, sim=100, bw="", mixes=[1, 3, 5, 7, 9, 12, 13, 16, 17, 19, 24, 28, 33, 49]),
@@ -87,6 +88,15 @@ def parse(path, n):
                           miss=g(p + r"LLC_total_miss\s+(\d+)") or 0, wbmiss=g(p + r"LLC_writeback_miss\s+(\d+)") or 0,
                           final_level=g(p + r"coord_final_level\s+(\d+)"),
                           avg_ways=g(p + r"coord_avg_ways\s+(\S+)"),
+                          L1D_load_miss=g(p + r"L1D_load_miss\s+(\d+)"), L2C_load_miss=g(p + r"L2C_load_miss\s+(\d+)"),
+                          LLC_load_miss=g(p + r"LLC_load_miss\s+(\d+)"),
+                          pf_requested=(g(p + r"L1D_prefetch_requested\s+(\d+)") or 0) + (g(p + r"L2C_prefetch_requested\s+(\d+)") or 0),
+                          pf_issued=(g(p + r"L1D_prefetch_issued\s+(\d+)") or 0) + (g(p + r"L2C_prefetch_issued\s+(\d+)") or 0),
+                          LLC_pf_req=g(p + r"LLC_prefetches\s+(\d+)"), LLC_pf_miss=g(p + r"LLC_prefetch_miss\s+(\d+)"),
+                          pf_useful=(g(p + r"L1D_prefetch_useful\s+(\d+)") or 0) + (g(p + r"L2C_prefetch_useful\s+(\d+)") or 0),
+                          pf_useless=(g(p + r"L1D_prefetch_useless\s+(\d+)") or 0) + (g(p + r"L2C_prefetch_useless\s+(\d+)") or 0),
+                          pf_late=(g(p + r"L1D_prefetch_late\s+(\d+)") or 0) + (g(p + r"L2C_prefetch_late\s+(\d+)") or 0),
+                          psr=g(p + r"coord_psr\s+(\S+)"),
                           lvl_epochs=[int(x) for x in (re.search(p + r"coord_epochs_at_level((?:\s+\d+)+)", t, re.M).group(1).split()
                                                        if re.search(p + r"coord_epochs_at_level", t, re.M) else [])]))
     vs = re.search(r"^COORD_VSUM (.*)$", t, re.M)
@@ -95,7 +105,7 @@ def parse(path, n):
     for c in range(n):                                  # UCP's own allocation, averaged over its repartitions
         cores[c]["ucp_avg_ways"] = round(sum(q[c] for q in uq) / len(uq), 3) if uq and all(len(q) == n for q in uq) else None
     bw = [g(r"^DRAM_bw_level_%d\s+(\d+)" % k) for k in range(4)]
-    res = dict(cores=cores, vsum=vs.group(1) if vs else "", wsum=ws.group(1) if ws else "", complete=all(c["ipc"] for c in cores),
+    res = dict(cores=cores, vsum=vs.group(1) if vs else "", wsum=ws.group(1) if ws else "", path=str(path), complete=all(c["ipc"] for c in cores),
                sim=g(r"^simulation_instructions\s+(\d+)"), sets=g(r"^llc_set\s+(\d+)\s*$"),
                busy50=(bw[2] + bw[3]) / sum(bw) if all(x is not None for x in bw) and sum(bw) else None)
     _PC[k] = res
@@ -126,6 +136,8 @@ def main():
     ap.add_argument("--no-build", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--report-only", action="store_true")
+    ap.add_argument("--base-variants", default="vpt,vpt_part", help="built-in variants to include (vpt, vpt_part)")
+    ap.add_argument("--sweep-ref", default="v22", help="reference variant of the sw_<PARAM>_<value> sweep variants")
     ap.add_argument("--tag", default=None, help="name of this report: eval_report_<tag>.xlsx, eval_<table>_<tag>.csv "
                     "(default: date-time).  Existing reports are never overwritten.")
     ap.add_argument("--runner-arg", action="append", default=[], dest="runner_args")
@@ -136,11 +148,15 @@ def main():
         for S in SETUPS.values():
             S["warm"], S["sim"] = float(w), float(sm)
     a.tag = re.sub(r"[^A-Za-z0-9_.-]", "_", a.tag) if a.tag else datetime.now().strftime("%Y%m%d-%H%M")
+    global SWEEP_REF
+    SWEEP_REF = a.sweep_ref
     root = a.root.resolve()
     odir = (a.oracle_dir or root / "oracle_results").resolve()
     sdir = (a.scaleup_dir or root / "scaleup_8core_results").resolve()
     out = (a.out or root / "eval_results").resolve()
-    variants = [("vpt", "+coord=victim"), ("vpt_part", "+coord=victim+cv=V_PART:1")] + [(v.split("=", 1)[0], "+coord=victim" + v.split("=", 1)[1]) for v in a.variant]
+    base_v = {"vpt": "+coord=victim", "vpt_part": "+coord=victim+cv=V_PART:1"}
+    variants = [(k, base_v[k]) for k in a.base_variants.split(",") if k in base_v] \
+        + [(v.split("=", 1)[0], "+coord=victim" + v.split("=", 1)[1]) for v in a.variant]
     pfs = [p for p in a.prefetchers.split(",") if p]
     setups = [s for s in a.setups.split(",") if s]
     if a.mixes_4core:
@@ -267,7 +283,35 @@ def main():
             for p in list(procs):
                 p.send_signal(signal.SIGTERM)
             time.sleep(3)
-    report(uniq.values(), variants, pfs, setups, odir, out, a.tag)
+    report(uniq.values(), variants, pfs, setups, odir, out, a.tag, mixcsv8)
+
+
+STATS = ("IPC", "L1D_load_miss", "L2C_load_miss", "LLC_load_miss", "pf_requested", "pf_issued", "LLC_pf_req",
+         "LLC_pf_miss", "pf_useful", "pf_useless", "pf_late")
+
+
+def cstat(c, k):
+    return c["ipc"] if k == "IPC" else c.get(k)
+
+
+_MIXINFO = {}
+
+
+def mix_info(setup, mix, logpath, mixcsv8):
+    """(mix type, [class of core 0..n-1]) from the mixes.csv the runner wrote next to the run (or the 8-core list)."""
+    k = (SETUPS[setup]["cores"], mix)
+    if k in _MIXINFO:
+        return _MIXINFO[k]
+    cands = [mixcsv8] if SETUPS[setup]["cores"] == 8 else []
+    if logpath:
+        cands.append(Path(logpath).parent.parent / "mixes.csv")
+    for f in cands:
+        if f and Path(f).is_file():
+            for r in csv.DictReader(open(f)):
+                if int(r["mix_id"]) == mix:
+                    _MIXINFO[k] = (r["type"], [r["core%d_class" % i] for i in range(k[0])])
+                    return _MIXINFO[k]
+    return ("?", ["?"] * k[0])
 
 
 def out_name(out, tag, stem, ext):
@@ -278,7 +322,7 @@ def out_name(out, tag, stem, ext):
     return f
 
 
-def report(jobs, variants, pfs, setups, odir, out, tag):
+def report(jobs, variants, pfs, setups, odir, out, tag, mixcsv8=None):
     by = defaultdict(dict)
     for j in jobs:
         if j.log:
@@ -307,7 +351,8 @@ def report(jobs, variants, pfs, setups, odir, out, tag):
                 continue
             v = R[vn]
             sp = [x["ipc"] / y["ipc"] for x, y in zip(v["cores"], b["cores"])]
-            row = dict(setup=s, prefetcher=p, mix=m, variant=vn, NWS_vs_independent=round(sum(sp) / n, 4),
+            mtype, mcls = mix_info(s, m, v.get("path"), mixcsv8)
+            row = dict(setup=s, prefetcher=p, mix=m, mix_type=mtype, variant=vn, NWS_vs_independent=round(sum(sp) / n, 4),
                        worst_core_vs_independent=round(min(sp), 4),
                        HS_vs_independent=round(n / sum(1 / x for x in sp), 4))
             if ref:
@@ -324,16 +369,28 @@ def report(jobs, variants, pfs, setups, odir, out, tag):
             row.update(DRAM_RPKI_independent=round(dr(b), 3), DRAM_RPKI_coord=round(dr(v), 3),
                        DRAM_busy50_independent=b["busy50"], DRAM_busy50_coord=v["busy50"], trials=v["vsum"],
                        way_trials=v.get("wsum", ""))
+            for k in STATS:                                   # mix total and per-core average, independent vs controller
+                for tagx, run in (("independent", b), ("coord", v)):
+                    vals = [cstat(c, k) for c in run["cores"]]
+                    if all(x is not None for x in vals):
+                        row["%s_total_%s" % (k, tagx)] = round(sum(vals), 5 if k == "IPC" else 0)
+                        row["%s_avg_%s" % (k, tagx)] = round(sum(vals) / n, 5 if k == "IPC" else 1)
             mixrows.append(row)
             for i in range(n):
-                corerows.append(dict(setup=s, prefetcher=p, mix=m, variant=vn, core=i, speedup_vs_independent=round(sp[i], 4),
-                                     independent_vs_noPF=round(b["cores"][i]["ipc"] / ref["cores"][i]["ipc"], 4) if ref else None,
+                cr = dict(setup=s, prefetcher=p, mix=m, mix_type=mtype, variant=vn, core=i, core_class=mcls[i],
+                          speedup_vs_independent=round(sp[i], 4),
+                          independent_vs_noPF=round(b["cores"][i]["ipc"] / ref["cores"][i]["ipc"], 4) if ref else None,
                                      coord_vs_noPF=round(v["cores"][i]["ipc"] / ref["cores"][i]["ipc"], 4) if ref else None,
                                      final_level=v["cores"][i]["final_level"],
                                      ucp_avg_ways_independent=b["cores"][i].get("ucp_avg_ways"),
                                      coord_avg_ways=v["cores"][i].get("avg_ways") if v["cores"][i].get("avg_ways") is not None
                                      else v["cores"][i].get("ucp_avg_ways"),
-                                     epochs_at_level_0_1_2_3=" ".join(map(str, v["cores"][i]["lvl_epochs"]))))
+                                     epochs_at_level_0_1_2_3=" ".join(map(str, v["cores"][i]["lvl_epochs"])),
+                                     psr=v["cores"][i].get("psr"))
+                for k in STATS:
+                    cr["%s_independent" % k] = cstat(b["cores"][i], k)
+                    cr["%s_coord" % k] = cstat(v["cores"][i], k)
+                corerows.append(cr)
     for (s, p, vn) in sorted({(r["setup"], r["prefetcher"], r["variant"]) for r in mixrows}):
         R = [r for r in mixrows if (r["setup"], r["prefetcher"], r["variant"]) == (s, p, vn)]
         g = math.exp(st.mean(math.log(r["NWS_vs_independent"]) for r in R))
@@ -347,8 +404,54 @@ def report(jobs, variants, pfs, setups, odir, out, tag):
                          mean_worst_vs_noPF_independent=round(st.mean(r["independent_worst_vs_noPF"] for r in R if "independent_worst_vs_noPF" in r), 4) if any("independent_worst_vs_noPF" in r for r in R) else None,
                          mean_worst_vs_noPF_coord=round(st.mean(r["coord_worst_vs_noPF"] for r in R if "coord_worst_vs_noPF" in r), 4) if any("coord_worst_vs_noPF" in r for r in R) else None,
                          median_share_of_oracle_headroom=round(st.median(sh), 3) if sh else None))
+    gm = lambda xs: round(math.exp(st.mean(math.log(x) for x in xs)), 4) if xs else None
+    # ---- generalisation: by mix type and by workload class
+    bytype = []
+    for key in sorted({(r["setup"], r["prefetcher"], r["variant"], r["mix_type"]) for r in mixrows}):
+        R = [r for r in mixrows if (r["setup"], r["prefetcher"], r["variant"], r["mix_type"]) == key]
+        bytype.append(dict(setup=key[0], prefetcher=key[1], variant=key[2], mix_type=key[3], mixes=len(R),
+                           geomean_NWS_vs_independent=gm([r["NWS_vs_independent"] for r in R]),
+                           mixes_better_1pct=sum(r["NWS_vs_independent"] >= 1.01 for r in R),
+                           mixes_worse_1pct=sum(r["NWS_vs_independent"] <= 0.99 for r in R),
+                           casualties_independent=sum(r.get("casualties_independent", 0) for r in R),
+                           casualties_coord=sum(r.get("casualties_coord", 0) for r in R),
+                           mean_worst_vs_noPF_independent=round(st.mean(r["independent_worst_vs_noPF"] for r in R), 4) if all("independent_worst_vs_noPF" in r for r in R) else None,
+                           mean_worst_vs_noPF_coord=round(st.mean(r["coord_worst_vs_noPF"] for r in R), 4) if all("coord_worst_vs_noPF" in r for r in R) else None))
+    byclass = []
+    for key in sorted({(r["setup"], r["prefetcher"], r["variant"], r["core_class"]) for r in corerows}):
+        R = [r for r in corerows if (r["setup"], r["prefetcher"], r["variant"], r["core_class"]) == key]
+        hasref = [r for r in R if r.get("coord_vs_noPF") is not None]
+        byclass.append(dict(setup=key[0], prefetcher=key[1], variant=key[2], core_class=key[3], cores=len(R),
+                            geomean_speedup_vs_independent=gm([r["speedup_vs_independent"] for r in R]),
+                            cores_better_2pct=sum(r["speedup_vs_independent"] >= 1.02 for r in R),
+                            cores_worse_2pct=sum(r["speedup_vs_independent"] <= 0.98 for r in R),
+                            casualties_independent=sum(r["independent_vs_noPF"] < 0.98 for r in hasref),
+                            casualties_coord=sum(r["coord_vs_noPF"] < 0.98 for r in hasref),
+                            mean_vs_noPF_independent=round(st.mean(r["independent_vs_noPF"] for r in hasref), 4) if hasref else None,
+                            mean_vs_noPF_coord=round(st.mean(r["coord_vs_noPF"] for r in hasref), 4) if hasref else None))
+    # ---- parameter sweep: variants named sw_<PARAM>_<value>, compared with the reference variant on the same mixes
+    sweep = []
+    swv = sorted({r["variant"] for r in mixrows if r["variant"].startswith("sw_")})
+    if swv:
+        refv = SWEEP_REF
+        for s_, p_ in sorted({(r["setup"], r["prefetcher"]) for r in mixrows}):
+            ref = {r["mix"]: r for r in mixrows if (r["setup"], r["prefetcher"], r["variant"]) == (s_, p_, refv)}
+            for vn in [refv] + swv:
+                R = [r for r in mixrows if (r["setup"], r["prefetcher"], r["variant"]) == (s_, p_, vn) and r["mix"] in ref]
+                if not R:
+                    continue
+                par, _, val = vn[3:].rpartition("_") if vn != refv else ("(reference %s)" % refv, "", "default")
+                g = gm([r["NWS_vs_independent"] for r in R])
+                gref = gm([ref[r["mix"]]["NWS_vs_independent"] for r in R])
+                sweep.append(dict(setup=s_, prefetcher=p_, parameter=par, value=val, variant=vn, mixes=len(R),
+                                  geomean_NWS_vs_independent=g, change_vs_reference_pct=round(100 * (g / gref - 1), 2),
+                                  casualties_coord=sum(r.get("casualties_coord", 0) for r in R),
+                                  casualties_reference=sum(ref[r["mix"]].get("casualties_coord", 0) for r in R),
+                                  casualties_independent=sum(r.get("casualties_independent", 0) for r in R),
+                                  mean_worst_vs_noPF=round(st.mean(r["coord_worst_vs_noPF"] for r in R), 4) if all("coord_worst_vs_noPF" in r for r in R) else None))
     out.mkdir(parents=True, exist_ok=True)
-    for name, data in (("summary", summ), ("mix", mixrows), ("core", corerows)):
+    for name, data in (("summary", summ), ("mix", mixrows), ("core", corerows), ("bytype", bytype), ("byclass", byclass),
+                       ("sweep", sweep)):
         if data:
             keys = list(dict.fromkeys(k for d in data for k in d))
             with open(out_name(out, tag, "eval_%s" % name, "csv"), "w", newline="") as f:
@@ -362,8 +465,15 @@ def report(jobs, variants, pfs, setups, odir, out, tag):
         first = True
         for name, data, note in (("Summary", summ, "Controller vs independent UCP + prefetcher (NWS = mean per-core IPC ratio); "
                                   "casualty = core > 2% slower than plain LRU without prefetching"),
-                                 ("Per mix", mixrows, "One row per mix, prefetcher and controller variant"),
-                                 ("Per core", corerows, "Per core: speedups and the prefetch levels the controller used")):
+                                 ("By mix type", bytype, "Generalisation: per mix type (class composition), controller vs independent"),
+                                 ("By class", byclass, "Per workload class of the core (HC/LC = high/low cache sensitivity, "
+                                  "HP/LP = high/low prefetch sensitivity); casualty = core > 2% slower than without prefetching"),
+                                 ("Sweep", sweep, "Parameter sweep: variants sw_<PARAM>_<value> vs the reference variant on the "
+                                  "same mixes (one parameter changed at a time)"),
+                                 ("Per mix", mixrows, "One row per mix, prefetcher and controller variant; *_total_* / *_avg_* = "
+                                  "sum / mean over the cores (IPC, demand load misses, prefetch requests and LLC prefetch misses)"),
+                                 ("Per core", corerows, "Per core: speedups, prefetch levels, ways, PSR and the raw counters "
+                                  "(independent vs controller)")):
             ws = wb.active if first else wb.create_sheet(name)
             ws.title = name
             first = False

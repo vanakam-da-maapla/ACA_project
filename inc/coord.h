@@ -65,6 +65,17 @@
 //                           below (and it is then throttled as a polluter, keep-or-revert).  Ways come from donors
 //                           (cores prefetchAlloc does not enlarge), at most COORD_V_DONOR (1/3) of each donor's ways,
 //                           >= 1 way kept, always from the donor that loses the fewest demand hits.
+//   v2.2 (all off by default):
+//           COORD_V_WAYS=4  reclaim partition: start from UCP's own split (prefetchAlloc); a core that it gives more ways
+//                           than the demand-only split (defaultAlloc) keeps PSR^COORD_V_GAMMA of those prefetch-won ways;
+//                           the reclaimed ways go one by one to the core whose next way has the most demand hits.  With
+//                           accurate, timely prefetchers the split equals UCP's.  Acts only if prefetch-won ways >=
+//                           COORD_V_WTRIG.  A requester with PSR < COORD_V_PSRLO is throttled in the same trial
+//                           (coupled move: the trial must then improve the score by COORD_V_GAIN, like a throttle step).
+//           COORD_V_WSTEP   move at most this many ways per period
+//           COORD_V_GUARD   victim guard: reject a down / way trial if any other core's IPC drops by more than this
+//           COORD_V_DROP2   a pressure throttle drops two levels at once if the core's accuracy is below this
+//           COORD_V_POLL=1  rank self-harm suspects also by the share of their LLC blocks that are unused prefetches
 //
 // Environment:
 //   COORD_EPOCH_CYCLES  epoch length in uncore cycles (default 1000000)

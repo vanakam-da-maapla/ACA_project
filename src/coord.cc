@@ -1,3 +1,4 @@
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -76,6 +77,13 @@ struct VParams {
     uint32_t wmin = 1;                    // COORD_V_WMIN: trial a new allocation only if it moves >= this many ways
     double   psr_hi = 0.6, psr_lo = 0.3;  // COORD_V_PSRHI / COORD_V_PSRLO: prefetch-success-rate tiers (COORD_V_WAYS=3)
     double   grant_hi = 0.8, grant_mid = 0.4, donor_frac = 1.0 / 3.0;
+    // ---- v2.2 (all off by default)
+    uint32_t wtrig = 0;                   // COORD_V_WTRIG: mode 4 acts only if prefetch-won ways >= this (else UCP's split)
+    uint32_t wstep = 0;                   // COORD_V_WSTEP: move at most this many ways per period (0 = no limit)
+    double   gamma = 1.0;                 // COORD_V_GAMMA: a requester keeps PSR^gamma of its prefetch-won ways
+    double   guard = 0.0;                 // COORD_V_GUARD: reject a down/way trial if another core loses > guard
+    double   drop2 = 0.0;                 // COORD_V_DROP2: accuracy below which a pressure throttle drops two levels
+    bool     poll = false;                // COORD_V_POLL=1: rank self-harm suspects also by unused-prefetch LLC share
 };
 VParams  vp;
 double   bw_acc = 0.0;                    // sum of the DRAM bandwidth level over the cycles of the epoch
@@ -112,6 +120,11 @@ uint64_t quota_epochs[NUM_CPUS];
 double   tim_ewma[NUM_CPUS];              // prefetch timeliness: on-time useful / (useful + late), EWMA
 uint32_t wblock_left = 0;                 // v2.1: periods left without way trials after a revert
 uint64_t n_grant = 0, n_poll = 0;         // PSR mode: ways granted to prefetch-successful cores, polluter throttles
+int      coupled_core = -1;               // v2.2: core throttled together with the running way trial (coupled move)
+uint8_t  coupled_old = 0;
+double   trial_rsum[NUM_CPUS];            // per-core IPC ratio summed over the running trial (victim guard)
+double   poll_share[NUM_CPUS];            // share of a core's LLC blocks that are prefetched and still unused
+uint64_t n_reclaim = 0, n_keepucp = 0, n_coupled = 0, n_coupled_ok = 0, n_guard = 0, n_drop2 = 0;
 
 PfCounters read_pf(const CACHE &c)
 {
@@ -199,6 +212,8 @@ void start_trial(int j, int dir, const char *why, double bwavg)
     trial_left = vp.trial;
     trial_n = 0;
     trial_score = trial_self = 0.0;
+    for (uint32_t i = 0; i < NUM_CPUS; i++)
+        trial_rsum[i] = 0.0;
     update_gate();
     std::printf("COORD_V e=%llu trial core=%d %s to level %u (%s, bw=%.2f, useless=%.3f, traffic=%.3f, acc=%.3f)\n",
                 (unsigned long long)epoch_index, j, dir < 0 ? "down" : "up", (unsigned)level[j], why, bwavg,
@@ -358,6 +373,102 @@ void psr_alloc(double dmu[NUM_CPUS][LLC_WAY], double pfu[NUM_CPUS][LLC_WAY], uin
     }
 }
 
+// Victim guard: no other core may lose more than COORD_V_GUARD (mean IPC ratio over the trial) -- protects per-core
+// slowdown even when the mix average improves.
+bool guard_ok(int exclude)
+{
+    if (vp.guard <= 0.0 || trial_n == 0)
+        return true;
+    for (uint32_t i = 0; i < NUM_CPUS; i++)
+        if ((int)i != exclude && trial_rsum[i] / trial_n < 1.0 - vp.guard)
+            return false;
+    return true;
+}
+
+// COORD_V_WAYS=4, reclaim mode (v2.2).  Start from UCP's own split (prefetchAlloc: demand + prefetch hits) and take
+// back only the ways a core cannot justify: a core that prefetchAlloc gives more ways than defaultAlloc (demand hits
+// only) keeps PSR^gamma of those prefetch-won ways; the reclaimed ways go, one at a time, to the core whose next way
+// has the most DEMAND hits (UCP's marginal-utility rule).  With accurate, timely prefetchers nothing is reclaimed and
+// the split equals UCP's.  The partition is only touched when prefetch-won ways >= COORD_V_WTRIG.  A requester with
+// PSR < COORD_V_PSRLO is a polluter: it is throttled in the same trial (coupled move).
+void reclaim_alloc(double dmu[NUM_CPUS][LLC_WAY], double pfu[NUM_CPUS][LLC_WAY], uint32_t *q, int *polluter)
+{
+    double both[NUM_CPUS][LLC_WAY];
+    for (uint32_t c = 0; c < NUM_CPUS; c++)
+        for (uint32_t r = 0; r < LLC_WAY; r++)
+            both[c][r] = dmu[c][r] + pfu[c][r];
+    uint32_t dA[NUM_CPUS], pA[NUM_CPUS];
+    lookahead(dmu, dA);
+    lookahead(both, pA);
+    *polluter = -1;
+    uint32_t won = 0;
+    for (uint32_t c = 0; c < NUM_CPUS; c++) {
+        q[c] = pA[c];
+        won += pA[c] > dA[c] ? pA[c] - dA[c] : 0;
+    }
+    if (won < vp.wtrig || won == 0) {
+        n_keepucp++;
+        return;
+    }
+    uint32_t freed = 0;
+    bool from[NUM_CPUS] = {};
+    double pworst = 0.0;
+    for (uint32_t c = 0; c < NUM_CPUS; c++) {
+        if (pA[c] <= dA[c])
+            continue;
+        const uint32_t extra = pA[c] - dA[c];
+        const double psr = psr_of(c);
+        uint32_t keep = (uint32_t)(std::pow(psr, vp.gamma) * extra + 0.5);
+        if (keep > extra)
+            keep = extra;
+        const uint32_t rec = extra - keep;
+        if (rec) {
+            q[c] -= rec;
+            freed += rec;
+            from[c] = true;
+        }
+        if (psr < vp.psr_lo && level[c] > 0 && !cooldown_left[c] && extra * (1.0 - psr) > pworst) {
+            pworst = extra * (1.0 - psr);
+            *polluter = (int)c;
+        }
+    }
+    n_reclaim += freed;
+    while (freed) {
+        int b = -1;
+        for (uint32_t pass = 0; pass < 2 && b < 0; pass++)
+            for (uint32_t c = 0; c < NUM_CPUS; c++)
+                if ((pass || !from[c]) && q[c] < LLC_WAY && (b < 0 || dmu[c][q[c]] > dmu[b][q[b]]))
+                    b = (int)c;
+        q[b]++;
+        freed--;
+    }
+}
+
+// Move from the current split towards target q by at most COORD_V_WSTEP ways (largest surplus -> largest deficit).
+void step_limit(uint32_t *q)
+{
+    if (!vp.wstep)
+        return;
+    uint32_t t[NUM_CPUS];
+    for (uint32_t i = 0; i < NUM_CPUS; i++)
+        t[i] = cur_q[i];
+    for (uint32_t k = 0; k < vp.wstep; k++) {
+        int a = -1, b = -1;
+        for (uint32_t i = 0; i < NUM_CPUS; i++) {
+            if (t[i] > q[i] && (a < 0 || t[i] - q[i] > t[a] - q[a]))
+                a = (int)i;
+            if (q[i] > t[i] && (b < 0 || q[i] - t[i] > q[b] - t[b]))
+                b = (int)i;
+        }
+        if (a < 0 || b < 0)
+            break;
+        t[a]--;
+        t[b]++;
+    }
+    for (uint32_t i = 0; i < NUM_CPUS; i++)
+        q[i] = t[i];
+}
+
 // Partition step (every COORD_V_WPERIOD epochs outside trials): the controller's own allocation from the split
 // utility monitor.  Mode 1 counts a core's prefetch-request hits in proportion to its prefetch accuracy, so an
 // inaccurate prefetcher cannot inflate its core's utility and take ways from cache-sensitive neighbours.
@@ -376,10 +487,27 @@ bool ways_step(double bwavg)
         }
     }
     ucp_umon_decay();
+    if (std::getenv("COORD_V_DEBUG")) {                // shadow-tag hit totals per core: demand / prefetch
+        std::printf("COORD_U e=%llu", (unsigned long long)epoch_index);
+        for (uint32_t c = 0; c < NUM_CPUS; c++) {
+            double d = 0, f = 0;
+            for (uint32_t r = 0; r < LLC_WAY; r++) {
+                d += dmu[c][r];
+                f += pfu[c][r];
+            }
+            std::printf(" c%u=%.0f/%.0f", c, d, f);
+        }
+        std::printf("\n");
+    }
     uint32_t q[NUM_CPUS];
-    if (vp.ways == 3) {
+    int pol4 = -1;
+    if (vp.ways == 4) {
+        reclaim_alloc(dmu, pfu, q, &pol4);
+        step_limit(q);
+    } else if (vp.ways == 3) {
         int polluter = -1;
         psr_alloc(dmu, pfu, q, &polluter);
+        step_limit(q);                                 // COORD_V_WSTEP (0 = off) also limits the PSR rule's moves
         if (polluter >= 0 && pending_gainer < 0) {     // throttle the polluter next (as a normal keep-or-revert trial)
             pending_gainer = polluter;
             n_poll++;
@@ -387,27 +515,34 @@ bool ways_step(double bwavg)
     } else {
         lookahead(u, q);
     }
+    auto no_way_trial = [&]() {                        // mode 4: the polluter is still throttled (plain trial)
+        if (pol4 >= 0 && pending_gainer < 0) {
+            pending_gainer = pol4;
+            n_poll++;
+        }
+        return false;
+    };
     if (wcool_left)
         wcool_left--;
     if (same_q(q, cur_q)) {
         n_w_same++;
-        return false;
+        return no_way_trial();
     }
     if (vp.fix) {
         if (wblock_left) {                             // recently reverted: let the partition settle
             wblock_left--;
-            return false;
+            return no_way_trial();
         }
         uint32_t moved = 0;
         for (uint32_t i = 0; i < NUM_CPUS; i++)
             moved += q[i] > cur_q[i] ? q[i] - cur_q[i] : 0;
         if (moved < vp.wmin) {                         // too small to be worth a trial (and the line migration)
             n_w_same++;
-            return false;
+            return no_way_trial();
         }
     }
     if (rej_valid && wcool_left && same_q(q, rej_q))
-        return false;
+        return no_way_trial();
     for (uint32_t i = 0; i < NUM_CPUS; i++) {
         prev_q[i] = cur_q[i];
         ref_before[i] = ref_ipc[i];
@@ -418,12 +553,27 @@ bool ways_step(double bwavg)
     trial_left = vp.wtrial;
     trial_n = 0;
     trial_score = 0.0;
-    std::printf("COORD_W e=%llu trial ways", (unsigned long long)epoch_index);
+    for (uint32_t i = 0; i < NUM_CPUS; i++)
+        trial_rsum[i] = 0.0;
+    coupled_core = -1;
+    if (pol4 >= 0) {                                   // coupled move: throttle the polluter in the same trial
+        coupled_core = pol4;
+        coupled_old = level[pol4];
+        const int d = (vp.drop2 > 0 && acc_ewma[pol4] < vp.drop2 && level[pol4] >= 2) ? 2 : 1;
+        level[pol4] = (uint8_t)(level[pol4] - d);
+        update_gate();
+        n_coupled++;
+        n_poll++;
+    }
+    std::printf("COORD_W e=%llu trial%s ways", (unsigned long long)epoch_index, coupled_core >= 0 ? " coupled" : "");
     for (uint32_t i = 0; i < NUM_CPUS; i++)
         std::printf("%s%u", i ? "-" : " ", prev_q[i]);
     std::printf(" ->");
     for (uint32_t i = 0; i < NUM_CPUS; i++)
         std::printf("%s%u", i ? "-" : " ", q[i]);
+    if (coupled_core >= 0)
+        std::printf(" + core %d level %u->%u (psr=%.3f)", coupled_core, (unsigned)coupled_old, (unsigned)level[coupled_core],
+                    psr_of((uint32_t)coupled_core));
     std::printf(" (bw=%.2f)\n", bwavg);
     return true;
 }
@@ -431,6 +581,20 @@ bool ways_step(double bwavg)
 // One decision step at the end of an epoch (deltas between o and n).
 void victim_step(const Snap &n, const Snap &o, double bwavg)
 {
+    if (vp.poll) {                                     // unused-prefetch share of each core's LLC blocks
+        uint64_t tot[NUM_CPUS] = {}, unused[NUM_CPUS] = {};
+        for (uint32_t st = 0; st < LLC_SET; st++)
+            for (uint32_t w = 0; w < LLC_WAY; w++) {
+                const BLOCK &b = uncore.LLC.block[st][w];
+                if (b.valid && b.cpu < NUM_CPUS) {
+                    tot[b.cpu]++;
+                    if (b.prefetch)
+                        unused[b.cpu]++;
+                }
+            }
+        for (uint32_t i = 0; i < NUM_CPUS; i++)
+            poll_share[i] = tot[i] ? (double)unused[i] / (double)tot[i] : 0.0;
+    }
     double ipc[NUM_CPUS];
     for (uint32_t i = 0; i < NUM_CPUS; i++) {
         const CoreSnap &a = n.core[i], &b = o.core[i];
@@ -473,12 +637,32 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
         for (uint32_t i = 0; i < NUM_CPUS; i++)
             pw[i] = (double)prev_q[i];                         // weights from the allocation before the trial
         trial_score += score_of(ipc, pw, avgw);
+        for (uint32_t i = 0; i < NUM_CPUS; i++)
+            trial_rsum[i] += ref_ipc[i] > 0 ? ipc[i] / ref_ipc[i] : 1.0;
         trial_n++;
         if (--trial_left > 0)
             return;
         const double score = trial_score / trial_n;
-        const bool ok = score >= 1.0 - (vp.wtol > -5 ? vp.wtol : vp.gain);
+        bool ok = score >= 1.0 - (vp.wtol > -5 ? vp.wtol : vp.gain);
+        if (coupled_core >= 0)                         // a coupled move must also pay for the throttle
+            ok = score >= 1.0 + vp.gain;
+        if (ok && !guard_ok(coupled_core)) {
+            ok = false;
+            n_guard++;
+        }
         in_trial = false;
+        const int cc = coupled_core;
+        coupled_core = -1;
+        if (cc >= 0) {
+            if (ok) {
+                n_coupled_ok++;
+                cooldown_left[cc] = vp.cooldown / 4;
+            } else {
+                level[cc] = coupled_old;
+                cooldown_left[cc] = vp.cooldown;
+            }
+            update_gate();
+        }
         if (ok) {
             n_w_ok++;
             for (uint32_t i = 0; i < NUM_CPUS; i++)
@@ -527,13 +711,19 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
         }
         trial_score += vp.score_am ? inv / wsum : wsum / inv;  // (weighted) harmonic mean (fairness) or arithmetic
         trial_self += ref_ipc[trial_core] > 0 ? ipc[trial_core] / ref_ipc[trial_core] : 1.0;
+        for (uint32_t i = 0; i < NUM_CPUS; i++)
+            trial_rsum[i] += ref_ipc[i] > 0 ? ipc[i] / ref_ipc[i] : 1.0;
         trial_n++;
         if (--trial_left > 0)
             return;
         const double score = trial_score / trial_n, self = trial_self / trial_n;
-        const bool ok = trial_dir < 0 ? score >= 1.0 + vp.gain
-                                       : score >= 1.0 + (vp.upgain > -0.5 ? vp.upgain : -vp.gain / 2);
+        bool ok = trial_dir < 0 ? score >= 1.0 + vp.gain
+                                 : score >= 1.0 + (vp.upgain > -0.5 ? vp.upgain : -vp.gain / 2);
         const int j = trial_core;
+        if (ok && trial_dir < 0 && !guard_ok(j)) {             // v2.2 victim guard (down trials only)
+            ok = false;
+            n_guard++;
+        }
         if (ok) {
             (trial_dir < 0 ? n_down_ok : n_up_ok)++;
             cooldown_left[j] = trial_dir < 0 ? vp.cooldown / 4 : 0;
@@ -582,7 +772,7 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
         pending_gainer = -1;
         if (level[g] > 0) {
             n_gainer++;
-            start_trial(g, -1, vp.ways == 3 ? "polluter/low-PSR-way-request" : "rollback/prefetch-inflated-utility", bwavg);
+            start_trial(g, -1, vp.ways >= 3 ? "polluter/low-PSR-way-request" : "rollback/prefetch-inflated-utility", bwavg);
             trial_rollback = vp.snap;
             return;
         }
@@ -601,7 +791,8 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
             const bool useless_rank = ((rank_turn + k) % 2 == 0);
             double m[NUM_CPUS];
             for (uint32_t i = 0; i < NUM_CPUS; i++)            // bandwidth hogs: prefer cores UCP gave few ways
-                m[i] = useless_rank ? cost_ewma[i] : traf_ewma[i] * (avgw / (ways[i] > 1.0 ? ways[i] : 1.0));
+                m[i] = useless_rank ? cost_ewma[i] * (vp.poll ? 1.0 + poll_share[i] : 1.0)
+                                    : traf_ewma[i] * (avgw / (ways[i] > 1.0 ? ways[i] : 1.0));
             double total = 0.0;
             int j = -1;
             for (uint32_t i = 0; i < NUM_CPUS; i++) {
@@ -612,7 +803,10 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
             if (j >= 0 && total > 0 && m[j] >= vp.share * total / NUM_CPUS) {
                 const bool useless = useless_rank;
                 rank_turn++;
-                start_trial(j, -1, useless ? "pressure/useless-traffic" : "pressure/bandwidth-hog", bwavg);
+                const bool two = vp.drop2 > 0 && acc_ewma[j] < vp.drop2 && level[j] >= 2;
+                if (two)
+                    n_drop2++;
+                start_trial(j, two ? -2 : -1, useless ? "pressure/useless-traffic" : "pressure/bandwidth-hog", bwavg);
                 return;
             }
         }
@@ -731,8 +925,15 @@ void coord_init()
         num("COORD_V_GRANTHI", vp.grant_hi);
         num("COORD_V_GRANTMID", vp.grant_mid);
         num("COORD_V_DONOR", vp.donor_frac);
-        if (vp.ways > 3)
-            die("COORD_V_WAYS must be 0, 1, 2 or 3");
+        cnt("COORD_V_WTRIG", vp.wtrig);
+        cnt("COORD_V_WSTEP", vp.wstep);
+        num("COORD_V_GAMMA", vp.gamma);
+        num("COORD_V_GUARD", vp.guard);
+        num("COORD_V_DROP2", vp.drop2);
+        if (const char *e = std::getenv("COORD_V_POLL"))
+            vp.poll = *e == '1';
+        if (vp.ways > 4)
+            die("COORD_V_WAYS must be 0..4");
         if (vp.ways && (!ucp_umon_hits || !ucp_umon_decay || !ucp_set_quota || !ucp_set_external_control))
             die("COORD_V_WAYS needs the ucp LLC replacement policy");
         if (vp.snap && !vp.ways)
@@ -809,9 +1010,12 @@ void coord_arm()
     if (policy == POLICY_VICTIM && vp.ways)
         std::printf("[COORD] v2.1: fix=%d wmin=%u psr_hi=%.2f psr_lo=%.2f grants=%.2f/%.2f donor=%.2f\n", (int)vp.fix,
                     vp.wmin, vp.psr_hi, vp.psr_lo, vp.grant_hi, vp.grant_mid, vp.donor_frac);
+    if (policy == POLICY_VICTIM)
+        std::printf("[COORD] v2.2: wtrig=%u wstep=%u gamma=%.2f guard=%.3f drop2=%.2f poll=%d\n", vp.wtrig, vp.wstep,
+                    vp.gamma, vp.guard, vp.drop2, (int)vp.poll);
     if (policy == POLICY_VICTIM && vp.ways)
         std::printf("[COORD] ways: mode=%u (%s) snap=%d period=%u trial=%u cool=%u tol=%.4f acc_lo=%.2f\n", vp.ways,
-                    vp.ways == 1 ? "accuracy-weighted utility" : vp.ways == 3 ? "PSR-guided" : "UCP utility", (int)vp.snap, vp.wperiod, vp.wtrial,
+                    vp.ways == 1 ? "accuracy-weighted utility" : vp.ways == 3 ? "PSR-guided" : vp.ways == 4 ? "reclaim (v2.2)" : "UCP utility", (int)vp.snap, vp.wperiod, vp.wtrial,
                     vp.wcool, vp.wtol > -5 ? vp.wtol : vp.gain, vp.acc_lo);
 }
 
@@ -855,9 +1059,11 @@ void coord_final_stats()
 {
     if (policy != POLICY_VICTIM)
         return;
-    std::printf("COORD_VSUM trials_down_kept=%llu trials_down=%llu trials_up_kept=%llu trials_up=%llu\n",
+    std::printf("COORD_VSUM trials_down_kept=%llu trials_down=%llu trials_up_kept=%llu trials_up=%llu guard_rejects=%llu "
+                "drop2=%llu\n",
                 (unsigned long long)n_down_ok, (unsigned long long)(n_down_ok + n_down_rej),
-                (unsigned long long)n_up_ok, (unsigned long long)(n_up_ok + n_up_rej));
+                (unsigned long long)n_up_ok, (unsigned long long)(n_up_ok + n_up_rej), (unsigned long long)n_guard,
+                (unsigned long long)n_drop2);
     for (uint32_t i = 0; i < NUM_CPUS; i++) {
         std::printf("Core_%u_coord_epochs_at_level", i);
         for (uint32_t l = 0; l < COORD_LEVELS; l++)
@@ -867,10 +1073,13 @@ void coord_final_stats()
     if (!vp.ways)
         return;
     std::printf("COORD_WSUM way_trials_kept=%llu way_trials=%llu unchanged=%llu gainer_throttles=%llu restores=%llu "
-                "psr_grants=%llu polluters=%llu\n",
+                "psr_grants=%llu polluters=%llu reclaimed=%llu ucp_kept=%llu coupled_kept=%llu coupled=%llu "
+                "guard_rejects=%llu drop2=%llu\n",
                 (unsigned long long)n_w_ok, (unsigned long long)(n_w_ok + n_w_rej), (unsigned long long)n_w_same,
                 (unsigned long long)n_gainer, (unsigned long long)n_restore, (unsigned long long)n_grant,
-                (unsigned long long)n_poll);
+                (unsigned long long)n_poll, (unsigned long long)n_reclaim, (unsigned long long)n_keepucp,
+                (unsigned long long)n_coupled_ok, (unsigned long long)n_coupled, (unsigned long long)n_guard,
+                (unsigned long long)n_drop2);
     for (uint32_t i = 0; i < NUM_CPUS; i++)
         std::printf("Core_%u_coord_pf_accuracy %.3f\nCore_%u_coord_pf_timeliness %.3f\nCore_%u_coord_psr %.3f\n", i,
                     acc_ewma[i], i, tim_ewma[i], i, psr_of(i));
