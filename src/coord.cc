@@ -70,6 +70,12 @@ struct VParams {
     uint32_t wperiod = 5, wtrial = 2, wcool = 3;
     double   wtol = -9.0;                 // a repartition is kept unless the score drops below 1 - wtol (default gain)
     double   acc_lo = 0.4;                // prefetch accuracy below which a core's way gain counts as prefetch-inflated
+    // ---- v2.1
+    bool     fix = false;                 // COORD_V_FIX=1: a restore cools down only the offending core (not every core);
+                                          // after a reverted way trial no way trial for COORD_V_WCOOL periods
+    uint32_t wmin = 1;                    // COORD_V_WMIN: trial a new allocation only if it moves >= this many ways
+    double   psr_hi = 0.6, psr_lo = 0.3;  // COORD_V_PSRHI / COORD_V_PSRLO: prefetch-success-rate tiers (COORD_V_WAYS=3)
+    double   grant_hi = 0.8, grant_mid = 0.4, donor_frac = 1.0 / 3.0;
 };
 VParams  vp;
 double   bw_acc = 0.0;                    // sum of the DRAM bandwidth level over the cycles of the epoch
@@ -103,6 +109,9 @@ uint32_t good_q[NUM_CPUS];
 bool     good_valid = false;
 uint64_t n_w_ok = 0, n_w_rej = 0, n_w_same = 0, n_gainer = 0, n_restore = 0;
 uint64_t quota_epochs[NUM_CPUS];
+double   tim_ewma[NUM_CPUS];              // prefetch timeliness: on-time useful / (useful + late), EWMA
+uint32_t wblock_left = 0;                 // v2.1: periods left without way trials after a revert
+uint64_t n_grant = 0, n_poll = 0;         // PSR mode: ways granted to prefetch-successful cores, polluter throttles
 
 PfCounters read_pf(const CACHE &c)
 {
@@ -276,28 +285,126 @@ double score_of(const double *ipc, const double *ways, double avgw)
     return vp.score_am ? inv / wsum : wsum / inv;
 }
 
+// Prefetch success rate of a core = accuracy x timeliness.
+double psr_of(uint32_t c)
+{
+    const double a = acc_ewma[c] < 0 ? 0 : acc_ewma[c] > 1 ? 1 : acc_ewma[c];
+    const double t = tim_ewma[c] < 0 ? 0 : tim_ewma[c] > 1 ? 1 : tim_ewma[c];
+    return a * t;
+}
+
+// COORD_V_WAYS=3, PSR-guided allocation.
+//   defaultAlloc  = UCP lookahead on DEMAND hits only (what a demand-only UCP would choose)
+//   prefetchAlloc = UCP lookahead on demand + prefetch hits (what UCP chooses when it sees prefetches)
+// Start from defaultAlloc.  Cores that prefetchAlloc gives more ways ("requesters") get a share of the extra ways by
+// their prefetch success rate PSR = accuracy x timeliness: >= psr_hi -> grant_hi (80%) of the extra ways, >= psr_lo
+// -> grant_mid (40%), below -> none.  The ways come from donors (cores prefetchAlloc gives no more ways than
+// defaultAlloc), each giving at most donor_frac (1/3) of its defaultAlloc ways and keeping >= 1 way; a way is always
+// taken from the donor that loses the fewest DEMAND hits by giving it up (the least cache-sensitive donor).
+// A requester with PSR < psr_lo is a polluter: its prefetches won it ways it cannot use -> *polluter (throttle it).
+void psr_alloc(double dmu[NUM_CPUS][LLC_WAY], double pfu[NUM_CPUS][LLC_WAY], uint32_t *q, int *polluter)
+{
+    double both[NUM_CPUS][LLC_WAY];
+    for (uint32_t c = 0; c < NUM_CPUS; c++)
+        for (uint32_t r = 0; r < LLC_WAY; r++)
+            both[c][r] = dmu[c][r] + pfu[c][r];
+    uint32_t dA[NUM_CPUS], pA[NUM_CPUS], budget[NUM_CPUS];
+    lookahead(dmu, dA);
+    lookahead(both, pA);
+    for (uint32_t c = 0; c < NUM_CPUS; c++) {
+        q[c] = dA[c];
+        budget[c] = 0;
+        if (pA[c] <= dA[c] && dA[c] > 1) {
+            const uint32_t b = (uint32_t)(dA[c] * vp.donor_frac);
+            budget[c] = b < dA[c] - 1 ? b : dA[c] - 1;
+        }
+    }
+    *polluter = -1;
+    double pworst = 0.0;
+    bool done[NUM_CPUS] = {};
+    for (;;) {                                         // requesters in order of PSR, best first
+        int i = -1;
+        for (uint32_t c = 0; c < NUM_CPUS; c++)
+            if (!done[c] && pA[c] > dA[c] && (i < 0 || psr_of(c) > psr_of((uint32_t)i)))
+                i = (int)c;
+        if (i < 0)
+            break;
+        done[i] = true;
+        const double psr = psr_of((uint32_t)i);
+        const uint32_t need = pA[i] - dA[i];
+        const double f = psr >= vp.psr_hi ? vp.grant_hi : psr >= vp.psr_lo ? vp.grant_mid : 0.0;
+        if (f == 0.0) {
+            const double m = (double)need * (1.0 - psr);
+            if (level[i] > 0 && !cooldown_left[i] && m > pworst) {
+                pworst = m;
+                *polluter = i;
+            }
+            continue;
+        }
+        uint32_t want = (uint32_t)(f * need + 0.5);
+        while (want > 0) {
+            int d = -1;
+            for (uint32_t c = 0; c < NUM_CPUS; c++)
+                if (budget[c] && q[c] > 1 && (d < 0 || dmu[c][q[c] - 1] < dmu[d][q[d] - 1]))
+                    d = (int)c;
+            if (d < 0)
+                break;
+            q[d]--;
+            budget[d]--;
+            q[i]++;
+            want--;
+            n_grant++;
+        }
+    }
+}
+
 // Partition step (every COORD_V_WPERIOD epochs outside trials): the controller's own allocation from the split
 // utility monitor.  Mode 1 counts a core's prefetch-request hits in proportion to its prefetch accuracy, so an
 // inaccurate prefetcher cannot inflate its core's utility and take ways from cache-sensitive neighbours.
 // A changed allocation is installed as a trial and kept only if the system score does not drop.
 bool ways_step(double bwavg)
 {
-    double u[NUM_CPUS][LLC_WAY];
+    double u[NUM_CPUS][LLC_WAY], dmu[NUM_CPUS][LLC_WAY], pfu[NUM_CPUS][LLC_WAY];
     for (uint32_t c = 0; c < NUM_CPUS; c++) {
         uint64_t dm[LLC_WAY], pf[LLC_WAY];
         ucp_umon_hits(c, dm, pf);
         const double a = vp.ways == 1 ? (acc_ewma[c] < 0 ? 0 : acc_ewma[c] > 1 ? 1 : acc_ewma[c]) : 1.0;
-        for (uint32_t r = 0; r < LLC_WAY; r++)
+        for (uint32_t r = 0; r < LLC_WAY; r++) {
             u[c][r] = (double)dm[r] + a * (double)pf[r];
+            dmu[c][r] = (double)dm[r];
+            pfu[c][r] = (double)pf[r];
+        }
     }
     ucp_umon_decay();
     uint32_t q[NUM_CPUS];
-    lookahead(u, q);
+    if (vp.ways == 3) {
+        int polluter = -1;
+        psr_alloc(dmu, pfu, q, &polluter);
+        if (polluter >= 0 && pending_gainer < 0) {     // throttle the polluter next (as a normal keep-or-revert trial)
+            pending_gainer = polluter;
+            n_poll++;
+        }
+    } else {
+        lookahead(u, q);
+    }
     if (wcool_left)
         wcool_left--;
     if (same_q(q, cur_q)) {
         n_w_same++;
         return false;
+    }
+    if (vp.fix) {
+        if (wblock_left) {                             // recently reverted: let the partition settle
+            wblock_left--;
+            return false;
+        }
+        uint32_t moved = 0;
+        for (uint32_t i = 0; i < NUM_CPUS; i++)
+            moved += q[i] > cur_q[i] ? q[i] - cur_q[i] : 0;
+        if (moved < vp.wmin) {                         // too small to be worth a trial (and the line migration)
+            n_w_same++;
+            return false;
+        }
     }
     if (rej_valid && wcool_left && same_q(q, rej_q))
         return false;
@@ -339,6 +446,11 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
             traf_ewma[i] = ref_ok ? vp.alpha * traf + (1 - vp.alpha) * traf_ewma[i] : traf;
             if (use + unu > 0)
                 acc_ewma[i] = ref_ok ? vp.alpha * acc + (1 - vp.alpha) * acc_ewma[i] : acc;
+            const double late = (double)(a.l1d.late - b.l1d.late + a.l2c.late - b.l2c.late);
+            if (use + late > 0) {
+                const double tim = use / (use + late);
+                tim_ewma[i] = ref_ok ? vp.alpha * tim + (1 - vp.alpha) * tim_ewma[i] : tim;
+            }
         }
         level_epochs[i][level[i]]++;
         if (vp.ways)
@@ -385,6 +497,8 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
         }
         rej_valid = true;
         wcool_left = vp.wcool;
+        if (vp.fix)
+            wblock_left = vp.wcool;
         install_q(prev_q);
         // the partition change hurt: if it gave ways to a core whose prefetcher is inaccurate, the core's utility was
         // inflated by its own prefetches -> throttle that core next (rollback first, then the prefetch knob)
@@ -442,7 +556,8 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
             n_restore++;
             for (uint32_t i = 0; i < NUM_CPUS; i++) {
                 level[i] = good_level[i];
-                cooldown_left[i] = vp.cooldown;
+                if (!vp.fix || (int)i == j)                    // v2.1: only the offending core waits
+                    cooldown_left[i] = vp.cooldown;
             }
             if (!same_q(good_q, cur_q))
                 install_q(good_q);
@@ -467,8 +582,8 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
         pending_gainer = -1;
         if (level[g] > 0) {
             n_gainer++;
-            start_trial(g, -1, "rollback/prefetch-inflated-utility", bwavg);
-            trial_rollback = true;
+            start_trial(g, -1, vp.ways == 3 ? "polluter/low-PSR-way-request" : "rollback/prefetch-inflated-utility", bwavg);
+            trial_rollback = vp.snap;
             return;
         }
     }
@@ -608,8 +723,16 @@ void coord_init()
         cnt("COORD_V_WCOOL", vp.wcool);
         num("COORD_V_WTOL", vp.wtol);
         num("COORD_V_ACCLO", vp.acc_lo);
-        if (vp.ways > 2)
-            die("COORD_V_WAYS must be 0, 1 or 2");
+        if (const char *e = std::getenv("COORD_V_FIX"))
+            vp.fix = *e == '1';
+        cnt("COORD_V_WMIN", vp.wmin);
+        num("COORD_V_PSRHI", vp.psr_hi);
+        num("COORD_V_PSRLO", vp.psr_lo);
+        num("COORD_V_GRANTHI", vp.grant_hi);
+        num("COORD_V_GRANTMID", vp.grant_mid);
+        num("COORD_V_DONOR", vp.donor_frac);
+        if (vp.ways > 3)
+            die("COORD_V_WAYS must be 0, 1, 2 or 3");
         if (vp.ways && (!ucp_umon_hits || !ucp_umon_decay || !ucp_set_quota || !ucp_set_external_control))
             die("COORD_V_WAYS needs the ucp LLC replacement policy");
         if (vp.snap && !vp.ways)
@@ -668,6 +791,7 @@ void coord_arm()
         for (uint32_t i = 0; i < NUM_CPUS; i++) {
             cur_q[i] = ucp_quota_of(i);
             acc_ewma[i] = 1.0;                                 // unknown accuracy = full credit (way mode only)
+            tim_ewma[i] = 1.0;
         }
         save_good();
     }
@@ -683,8 +807,11 @@ void coord_arm()
                     "bwlo=%.2f upgain=%.4f score=%s\n", vp.bw_hi, vp.gain, vp.share, vp.trial, vp.cooldown, vp.calm,
                     vp.retest, (int)vp.part, vp.bw_lo, vp.upgain, vp.score_am ? "am" : "hm");
     if (policy == POLICY_VICTIM && vp.ways)
+        std::printf("[COORD] v2.1: fix=%d wmin=%u psr_hi=%.2f psr_lo=%.2f grants=%.2f/%.2f donor=%.2f\n", (int)vp.fix,
+                    vp.wmin, vp.psr_hi, vp.psr_lo, vp.grant_hi, vp.grant_mid, vp.donor_frac);
+    if (policy == POLICY_VICTIM && vp.ways)
         std::printf("[COORD] ways: mode=%u (%s) snap=%d period=%u trial=%u cool=%u tol=%.4f acc_lo=%.2f\n", vp.ways,
-                    vp.ways == 1 ? "accuracy-weighted utility" : "UCP utility", (int)vp.snap, vp.wperiod, vp.wtrial,
+                    vp.ways == 1 ? "accuracy-weighted utility" : vp.ways == 3 ? "PSR-guided" : "UCP utility", (int)vp.snap, vp.wperiod, vp.wtrial,
                     vp.wcool, vp.wtol > -5 ? vp.wtol : vp.gain, vp.acc_lo);
 }
 
@@ -739,9 +866,14 @@ void coord_final_stats()
     }
     if (!vp.ways)
         return;
-    std::printf("COORD_WSUM way_trials_kept=%llu way_trials=%llu unchanged=%llu gainer_throttles=%llu restores=%llu\n",
+    std::printf("COORD_WSUM way_trials_kept=%llu way_trials=%llu unchanged=%llu gainer_throttles=%llu restores=%llu "
+                "psr_grants=%llu polluters=%llu\n",
                 (unsigned long long)n_w_ok, (unsigned long long)(n_w_ok + n_w_rej), (unsigned long long)n_w_same,
-                (unsigned long long)n_gainer, (unsigned long long)n_restore);
+                (unsigned long long)n_gainer, (unsigned long long)n_restore, (unsigned long long)n_grant,
+                (unsigned long long)n_poll);
+    for (uint32_t i = 0; i < NUM_CPUS; i++)
+        std::printf("Core_%u_coord_pf_accuracy %.3f\nCore_%u_coord_pf_timeliness %.3f\nCore_%u_coord_psr %.3f\n", i,
+                    acc_ewma[i], i, tim_ewma[i], i, psr_of(i));
     uint64_t ep = 0;
     for (uint32_t l = 0; l < COORD_LEVELS; l++)
         ep += level_epochs[0][l];

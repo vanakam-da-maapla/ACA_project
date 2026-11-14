@@ -53,6 +53,18 @@
 //                           throttling that core (its prefetches inflated its utility).  If that is rejected as well,
 //                           the last-good joint setting (all prefetch levels + way allocation, saved after every kept
 //                           decision) is restored.
+//   v2.1:
+//           COORD_V_FIX=1   (a) a snapshot restore puts only the offending core in cool-down (v2 froze every core's
+//                           throttling for COORD_V_COOLDOWN epochs after each restore); (b) after a reverted way trial,
+//                           no way trial for COORD_V_WCOOL periods (v2 only skipped the identical allocation)
+//           COORD_V_WMIN    trial a new allocation only if it moves at least this many ways (default 1)
+//           COORD_V_WAYS=3  PSR-guided partition.  defaultAlloc = lookahead on demand hits only, prefetchAlloc = on
+//                           demand + prefetch hits.  Start from defaultAlloc; a core that prefetchAlloc gives more ways
+//                           gets COORD_V_GRANTHI (0.8) of the extra ways if its prefetch success rate PSR = accuracy x
+//                           timeliness >= COORD_V_PSRHI (0.6), COORD_V_GRANTMID (0.4) if >= COORD_V_PSRLO (0.3), none
+//                           below (and it is then throttled as a polluter, keep-or-revert).  Ways come from donors
+//                           (cores prefetchAlloc does not enlarge), at most COORD_V_DONOR (1/3) of each donor's ways,
+//                           >= 1 way kept, always from the donor that loses the fewest demand hits.
 //
 // Environment:
 //   COORD_EPOCH_CYCLES  epoch length in uncore cycles (default 1000000)
