@@ -97,6 +97,8 @@ struct VParams {
     uint32_t retest_max = 64;
     double   phase = -1.0;                // COORD_V_PHASE: a throttled core whose IPC moved by more than this since its
                                           // last level change (phase change) is revalidated now; -1 = off
+    double   hold = 0.0;                  // COORD_V_HOLD: a throttled core with accuracy below this gets no up-trial and
+                                          // no calm release; at level 0 it is probed (one unjudged epoch at level 1)
     bool     calm_step = false;           // COORD_V_CALMSTEP=1: one level per CALM calm epochs (not one per epoch)             // COORD_V_RETESTMAX: back-off limit of the per-core revalidation interval
     double   psr_full = 0.0;              // COORD_V_PSRFULL: in WAYS=5, prefetch hits count fully once PSR >= this
                                           // (weight = min(1, PSR / PSRFULL)); 0 = weight PSR itself
@@ -118,7 +120,10 @@ double   trial_score = 0.0, trial_self = 0.0, trial_am = 0.0;
 uint32_t skip_left = 0;
 uint32_t since_change[NUM_CPUS];          // v3.1: epochs since this core's prefetch level last changed
 uint32_t retest_int[NUM_CPUS];
-double   ipc_at_change[NUM_CPUS];         // v3.2: reference IPC of a core when its level last changed
+double   ipc_at_change[NUM_CPUS];
+double   acc_raw[NUM_CPUS];               // v3.3: useful / filled prefetches of the last epoch (-1 = none filled)
+int      probe_core = -1;                 // v3.3: core in a one-epoch accuracy probe (level 1), or -1
+uint64_t n_probe = 0, n_hold_exit = 0;         // v3.2: reference IPC of a core when its level last changed
 uint64_t n_phase = 0;            // v3.1: per-core revalidation interval (doubles after a rejected one)
 uint64_t n_release = 0, n_revalid = 0;
 struct Burst {                            // v3.1 generic gate: keep the NEAREST requests of each prefetch burst
@@ -653,6 +658,11 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
         const double use = (double)(a.l1d.useful - b.l1d.useful + a.l2c.useful - b.l2c.useful);
         const double unu = (double)(a.l1d.useless - b.l1d.useless + a.l2c.useless - b.l2c.useless);
         const double acc = use + unu > 0 ? use / (use + unu) : 1.0;
+        // probe accuracy = useful hits / prefetches filled in this epoch: both are counted when they happen, whereas
+        // "useless" is only counted when an unused block is evicted (many epochs later), so useful/(useful+useless)
+        // over a single epoch overstates the accuracy of a junk prefetcher
+        const double fill = (double)(a.l1d.filled - b.l1d.filled + a.l2c.filled - b.l2c.filled);
+        acc_raw[i] = fill > 0 ? (use < fill ? use / fill : 1.0) : -1.0;
         const double traf = (double)(a.llc_pfmiss - b.llc_pfmiss) * 1000.0 / (double)epoch_cycles;
         const double cost = traf * (1.0 - acc);
         if (level[i] == COORD_LEVELS - 1 || !ref_ok || vp.v3) {  // v3: keep measuring while throttled (phases)
@@ -874,6 +884,29 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
         if (ways_step(bwavg))
             return;
     }
+    auto held = [&](uint32_t i) { return vp.hold > 0 && acc_ewma[i] < vp.hold; };
+    if (vp.v3 && probe_core >= 0) {
+        // v3.3: end of a one-epoch accuracy probe of a held core (level 1 for one epoch, not judged by IPC)
+        const int c = probe_core;
+        probe_core = -1;
+        if (acc_raw[c] >= vp.hold) {                           // prefetching became accurate (phase change):
+            acc_ewma[c] = acc_raw[c];                          // leave the hold, ramp up through normal trials
+            n_hold_exit++;
+            std::printf("COORD_V e=%llu probe core=%d acc=%.3f -> hold released, stays at level 1\n",
+                        (unsigned long long)epoch_index, c, acc_raw[c]);
+        } else {
+            level[c] = 0;
+            update_gate();
+            std::printf("COORD_V e=%llu probe core=%d acc=%.3f -> still held at level 0\n",
+                        (unsigned long long)epoch_index, c, acc_raw[c]);
+        }
+        since_change[c] = 0;
+        ipc_at_change[c] = ref_ipc[c];
+        const uint32_t cur = retest_int[c] ? retest_int[c] : vp.retest;
+        if (acc_raw[c] < vp.hold)
+            retest_int[c] = cur * 2 < vp.retest_max ? cur * 2 : vp.retest_max;
+        return;
+    }
     if (vp.v3) {
         // v3.1 periodic re-justification of every throttle.  (1) DRAM calm for COORD_V_CALM epochs: the reason for
         // throttling is gone -> every throttled core gets one level back now (no trial needed: prefetching is the
@@ -883,7 +916,7 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
         if (calm_epochs >= vp.calm) {
             bool any = false;
             for (uint32_t i = 0; i < NUM_CPUS; i++)
-                if (level[i] < COORD_LEVELS - 1) {
+                if (level[i] < COORD_LEVELS - 1 && !held(i)) {     // v3.3: held (inaccurate) cores stay down
                     level[i]++;
                     since_change[i] = 0;
                     ipc_at_change[i] = ref_ipc[i];
@@ -911,9 +944,17 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
                     cooldown_left[i] = 0;
                     n_phase++;
                 }
+        for (uint32_t i = 0; i < NUM_CPUS; i++)               // v3.3: probe held cores at level 0 when due
+            if (held(i) && level[i] == 0 && since_change[i] >= (retest_int[i] ? retest_int[i] : vp.retest)) {
+                probe_core = (int)i;
+                level[i] = 1;
+                update_gate();
+                n_probe++;
+                return;
+            }
         int r = -1;
         for (uint32_t i = 0; i < NUM_CPUS; i++)
-            if (level[i] < COORD_LEVELS - 1 && since_change[i] >= (retest_int[i] ? retest_int[i] : vp.retest) &&
+            if (level[i] < COORD_LEVELS - 1 && !held(i) && since_change[i] >= (retest_int[i] ? retest_int[i] : vp.retest) &&
                 !cooldown_left[i] &&
                 (r < 0 || since_change[i] > since_change[r]))
                 r = (int)i;
@@ -1082,6 +1123,7 @@ void coord_init()
         cnt("COORD_V_RETESTMAX", vp.retest_max);
         num("COORD_V_UPSELF", vp.up_self);
         num("COORD_V_PHASE", vp.phase);
+        num("COORD_V_HOLD", vp.hold);
         if (const char *e = std::getenv("COORD_V_CALMSTEP"))
             vp.calm_step = *e == '1';
         num("COORD_V_PROTECT", vp.protect);
@@ -1248,8 +1290,9 @@ void coord_final_stats()
                 (unsigned long long)n_drop2, (unsigned long long)n_self_rej, (unsigned long long)n_am_rej,
                 (unsigned long long)n_ways_inst);
     if (vp.v3)
-        std::printf("COORD_V3SUM calm_releases=%llu revalidations=%llu phase_resets=%llu\n",
-                    (unsigned long long)n_release, (unsigned long long)n_revalid, (unsigned long long)n_phase);
+        std::printf("COORD_V3SUM calm_releases=%llu revalidations=%llu phase_resets=%llu probes=%llu hold_exits=%llu\n",
+                    (unsigned long long)n_release, (unsigned long long)n_revalid, (unsigned long long)n_phase,
+                    (unsigned long long)n_probe, (unsigned long long)n_hold_exit);
     for (uint32_t i = 0; i < NUM_CPUS; i++) {
         std::printf("Core_%u_coord_epochs_at_level", i);
         for (uint32_t l = 0; l < COORD_LEVELS; l++)

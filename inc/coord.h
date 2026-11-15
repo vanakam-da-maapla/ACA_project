@@ -108,6 +108,12 @@
 //           COORD_V_PHASE   phase change: a throttled core whose IPC moved by more than this fraction since its level
 //                           last changed is revalidated immediately (interval reset), so a core whose prefetching
 //                           becomes useful again ramps back up level by level without waiting for the back-off
+//   v3.3:   COORD_V_HOLD    accuracy hold: a throttled core whose prefetch accuracy is below HOLD gets no up-trial and
+//                           no calm release (its harm -- pollution of its own ways, DRAM queueing -- builds up more
+//                           slowly than a 2-epoch trial, so IPC trials kept re-enabling it).  At level 0 it is probed
+//                           every revalidation interval: one unjudged epoch at level 1; accuracy >= HOLD in that
+//                           epoch (phase change) ends the hold and the normal gradual ramp follows.  0.15 from the
+//                           data: no core below it is helped by its prefetcher (22 of 22 IPCP cores, low bandwidth).
 //           Prefetching is never switched off in one step: each level down (two for accuracy < COORD_V_DROP2) is a
 //           separate trial that the throttled core itself must not lose by; every level back up is a separate trial.
 //           - a direct partition install (WAYS=5) takes its epoch: no throttle trial starts on top of it
