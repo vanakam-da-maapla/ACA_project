@@ -92,7 +92,12 @@ struct VParams {
     double   protect = 2.0;               // COORD_V_PROTECT: never trial-throttle a core with accuracy >= this
     uint32_t skip = 0;                    // COORD_V_SKIP: first epochs of a trial are not scored (transient)
     double   am_win = 0.01;               // COORD_V_AMWIN: a self-losing throttle is still kept if throughput rises this much
-    uint32_t retest_max = 64;             // COORD_V_RETESTMAX: back-off limit of the per-core revalidation interval
+    double   up_self = -1.0;              // COORD_V_UPSELF: an up-trial is also reverted if the re-enabled core itself
+                                          // loses more than this (its prefetching hurts it); -1 = off
+    uint32_t retest_max = 64;
+    double   phase = -1.0;                // COORD_V_PHASE: a throttled core whose IPC moved by more than this since its
+                                          // last level change (phase change) is revalidated now; -1 = off
+    bool     calm_step = false;           // COORD_V_CALMSTEP=1: one level per CALM calm epochs (not one per epoch)             // COORD_V_RETESTMAX: back-off limit of the per-core revalidation interval
     double   psr_full = 0.0;              // COORD_V_PSRFULL: in WAYS=5, prefetch hits count fully once PSR >= this
                                           // (weight = min(1, PSR / PSRFULL)); 0 = weight PSR itself
 };
@@ -112,7 +117,9 @@ uint32_t trial_left = 0, trial_n = 0;
 double   trial_score = 0.0, trial_self = 0.0, trial_am = 0.0;
 uint32_t skip_left = 0;
 uint32_t since_change[NUM_CPUS];          // v3.1: epochs since this core's prefetch level last changed
-uint32_t retest_int[NUM_CPUS];            // v3.1: per-core revalidation interval (doubles after a rejected one)
+uint32_t retest_int[NUM_CPUS];
+double   ipc_at_change[NUM_CPUS];         // v3.2: reference IPC of a core when its level last changed
+uint64_t n_phase = 0;            // v3.1: per-core revalidation interval (doubles after a rejected one)
 uint64_t n_release = 0, n_revalid = 0;
 struct Burst {                            // v3.1 generic gate: keep the NEAREST requests of each prefetch burst
     uint64_t cyc = ~0ULL, base = 0;
@@ -231,6 +238,7 @@ void start_trial(int j, int dir, const char *why, double bwavg)
     trial_kind = T_PF;
     trial_core = j;
     since_change[j] = 0;
+    ipc_at_change[j] = ref_ipc[j];
     trial_dir = dir;
     trial_left = vp.trial + vp.skip;
     skip_left = vp.skip;
@@ -788,6 +796,10 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
                 }
             } else {
                 ok = am >= 1.0 - vp.am_tol;
+                if (ok && vp.up_self >= 0 && self < 1.0 - vp.up_self) {   // v3.2: symmetric self test
+                    ok = false;
+                    n_self_rej++;
+                }
             }
         }
         if (ok && trial_dir < 0 && !guard_ok(j)) {             // v2.2 victim guard (down trials only)
@@ -828,6 +840,7 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
         }
         update_gate();
         since_change[j] = 0;
+        ipc_at_change[j] = ref_ipc[j];
         if (vp.v3) {                                           // v3.1: back off revalidations that keep failing
             const uint32_t cur = retest_int[j] ? retest_int[j] : vp.retest;
             retest_int[j] = (!ok && trial_dir > 0) ? (cur * 2 < vp.retest_max ? cur * 2 : vp.retest_max) : vp.retest;
@@ -873,17 +886,31 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
                 if (level[i] < COORD_LEVELS - 1) {
                     level[i]++;
                     since_change[i] = 0;
+                    ipc_at_change[i] = ref_ipc[i];
                     retest_int[i] = vp.retest;
                     n_release++;
                     any = true;
                 }
             if (any) {
-                update_gate();
                 std::printf("COORD_V e=%llu release one level (DRAM calm for %u epochs)\n",
                             (unsigned long long)epoch_index, calm_epochs);
+                if (vp.calm_step)                              // v3.2: next level only after another calm period
+                    calm_epochs = 0;
+                update_gate();
                 return;
             }
         }
+        if (vp.phase > 0)                                      // v3.2: phase change of a throttled core -> revalidate now
+            for (uint32_t i = 0; i < NUM_CPUS; i++)
+                if (level[i] < COORD_LEVELS - 1 && ipc_at_change[i] > 0 &&
+                    std::fabs(ref_ipc[i] / ipc_at_change[i] - 1.0) > vp.phase &&
+                    since_change[i] < (retest_int[i] ? retest_int[i] : vp.retest)) {
+                    retest_int[i] = vp.retest;
+                    since_change[i] = vp.retest;
+                    ipc_at_change[i] = ref_ipc[i];
+                    cooldown_left[i] = 0;
+                    n_phase++;
+                }
         int r = -1;
         for (uint32_t i = 0; i < NUM_CPUS; i++)
             if (level[i] < COORD_LEVELS - 1 && since_change[i] >= (retest_int[i] ? retest_int[i] : vp.retest) &&
@@ -1053,6 +1080,10 @@ void coord_init()
         num("COORD_V_AMWIN", vp.am_win);
         num("COORD_V_PSRFULL", vp.psr_full);
         cnt("COORD_V_RETESTMAX", vp.retest_max);
+        num("COORD_V_UPSELF", vp.up_self);
+        num("COORD_V_PHASE", vp.phase);
+        if (const char *e = std::getenv("COORD_V_CALMSTEP"))
+            vp.calm_step = *e == '1';
         num("COORD_V_PROTECT", vp.protect);
         cnt("COORD_V_SKIP", vp.skip);
         if (vp.ways > 5)
@@ -1217,8 +1248,8 @@ void coord_final_stats()
                 (unsigned long long)n_drop2, (unsigned long long)n_self_rej, (unsigned long long)n_am_rej,
                 (unsigned long long)n_ways_inst);
     if (vp.v3)
-        std::printf("COORD_V3SUM calm_releases=%llu revalidations=%llu\n", (unsigned long long)n_release,
-                    (unsigned long long)n_revalid);
+        std::printf("COORD_V3SUM calm_releases=%llu revalidations=%llu phase_resets=%llu\n",
+                    (unsigned long long)n_release, (unsigned long long)n_revalid, (unsigned long long)n_phase);
     for (uint32_t i = 0; i < NUM_CPUS; i++) {
         std::printf("Core_%u_coord_epochs_at_level", i);
         for (uint32_t l = 0; l < COORD_LEVELS; l++)

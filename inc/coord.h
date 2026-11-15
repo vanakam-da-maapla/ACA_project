@@ -100,6 +100,16 @@
 //             level 2 keeps the first half, level 1 the first quarter (avg burst size; single-request streams are
 //             thinned by a carried fraction), level 0 none -- a degree cut without touching the prefetcher
 //           - after a kept trial the reference IPC is the trial mean; after a reverted one the old reference stays
+//   v3.2:   COORD_V_UPSELF  an up-trial (revalidation / calm) is also reverted if the re-enabled core itself loses
+//                           more than this: a prefetcher that hurts its own core stays throttled even when the
+//                           throughput change is within noise (v3 re-enabled such cores about every other retest)
+//           COORD_V_CALMSTEP=1  a calm-DRAM release gives back one level per COORD_V_CALM calm epochs (gradual
+//                           0 -> 1 -> 2 -> 3, each level then subject to the self-tested trials), not one per epoch
+//           COORD_V_PHASE   phase change: a throttled core whose IPC moved by more than this fraction since its level
+//                           last changed is revalidated immediately (interval reset), so a core whose prefetching
+//                           becomes useful again ramps back up level by level without waiting for the back-off
+//           Prefetching is never switched off in one step: each level down (two for accuracy < COORD_V_DROP2) is a
+//           separate trial that the throttled core itself must not lose by; every level back up is a separate trial.
 //           - a direct partition install (WAYS=5) takes its epoch: no throttle trial starts on top of it
 //           COORD_V_PSRFULL prefetch hits count fully once PSR >= this (weight min(1, PSR/PSRFULL)).  Use 0.3: useful
 //                           IPCP prefetchers have accuracy 0.2-0.6 (PSR ~0.42) yet speed their core up 1.5x, while the
