@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -84,6 +85,16 @@ struct VParams {
     double   guard = 0.0;                 // COORD_V_GUARD: reject a down/way trial if another core loses > guard
     double   drop2 = 0.0;                 // COORD_V_DROP2: accuracy below which a pressure throttle drops two levels
     bool     poll = false;                // COORD_V_POLL=1: rank self-harm suspects also by unused-prefetch LLC share
+    // ---- v3 (all off by default): self-tested, throughput-safe throttling + deterministic PSR-weighted partition
+    bool     v3 = false;                  // COORD_V_V3=1: acceptance rules below
+    double   am_tol = 0.005;              // COORD_V_AMTOL: a change may cost at most this much throughput (mean IPC ratio)
+    double   self_tol = 0.01;             // COORD_V_SELFTOL: a throttled core may lose at most this much itself
+    double   protect = 2.0;               // COORD_V_PROTECT: never trial-throttle a core with accuracy >= this
+    uint32_t skip = 0;                    // COORD_V_SKIP: first epochs of a trial are not scored (transient)
+    double   am_win = 0.01;               // COORD_V_AMWIN: a self-losing throttle is still kept if throughput rises this much
+    uint32_t retest_max = 64;             // COORD_V_RETESTMAX: back-off limit of the per-core revalidation interval
+    double   psr_full = 0.0;              // COORD_V_PSRFULL: in WAYS=5, prefetch hits count fully once PSR >= this
+                                          // (weight = min(1, PSR / PSRFULL)); 0 = weight PSR itself
 };
 VParams  vp;
 double   bw_acc = 0.0;                    // sum of the DRAM bandwidth level over the cycles of the epoch
@@ -98,7 +109,18 @@ uint32_t cooldown_left[NUM_CPUS];
 bool     in_trial = false;
 int      trial_core = -1, trial_dir = 0;
 uint32_t trial_left = 0, trial_n = 0;
-double   trial_score = 0.0, trial_self = 0.0;
+double   trial_score = 0.0, trial_self = 0.0, trial_am = 0.0;
+uint32_t skip_left = 0;
+uint32_t since_change[NUM_CPUS];          // v3.1: epochs since this core's prefetch level last changed
+uint32_t retest_int[NUM_CPUS];            // v3.1: per-core revalidation interval (doubles after a rejected one)
+uint64_t n_release = 0, n_revalid = 0;
+struct Burst {                            // v3.1 generic gate: keep the NEAREST requests of each prefetch burst
+    uint64_t cyc = ~0ULL, base = 0;
+    uint32_t idx = 0, allowed = 0;
+    double   avg = 1.0, carry = 0.0;
+};
+Burst    burst[NUM_CPUS][2];
+uint64_t n_self_rej = 0, n_am_rej = 0, n_ways_inst = 0;
 uint32_t calm_epochs = 0, since_retest = 0;
 uint64_t n_down_ok = 0, n_down_rej = 0, n_up_ok = 0, n_up_rej = 0;
 uint64_t level_epochs[NUM_CPUS][COORD_LEVELS];
@@ -208,10 +230,12 @@ void start_trial(int j, int dir, const char *why, double bwavg)
     in_trial = true;
     trial_kind = T_PF;
     trial_core = j;
+    since_change[j] = 0;
     trial_dir = dir;
-    trial_left = vp.trial;
+    trial_left = vp.trial + vp.skip;
+    skip_left = vp.skip;
     trial_n = 0;
-    trial_score = trial_self = 0.0;
+    trial_score = trial_self = trial_am = 0.0;
     for (uint32_t i = 0; i < NUM_CPUS; i++)
         trial_rsum[i] = 0.0;
     update_gate();
@@ -501,6 +525,24 @@ bool ways_step(double bwavg)
     }
     uint32_t q[NUM_CPUS];
     int pol4 = -1;
+    if (vp.ways == 5) {
+        // v3 partition: UCP's lookahead on utility = demand hits + PSR x prefetch hits (PSR = accuracy x timeliness),
+        // installed directly every period like UCP itself (no trial).  Accurate, timely prefetchers -> UCP's split;
+        // inaccurate ones cannot win ways with their own useless prefetches.
+        for (uint32_t c = 0; c < NUM_CPUS; c++) {
+            const double w = vp.psr_full > 0 ? std::min(1.0, psr_of(c) / vp.psr_full) : psr_of(c);
+            for (uint32_t r = 0; r < LLC_WAY; r++)
+                u[c][r] = dmu[c][r] + w * pfu[c][r];
+        }
+        lookahead(u, q);
+        if (!same_q(q, cur_q)) {
+            install_q(q);
+            n_ways_inst++;
+            return vp.v3;                              // v3: no throttle trial in the same epoch (would measure both)
+        }
+        n_w_same++;
+        return false;
+    }
     if (vp.ways == 4) {
         reclaim_alloc(dmu, pfu, q, &pol4);
         step_limit(q);
@@ -605,7 +647,7 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
         const double acc = use + unu > 0 ? use / (use + unu) : 1.0;
         const double traf = (double)(a.llc_pfmiss - b.llc_pfmiss) * 1000.0 / (double)epoch_cycles;
         const double cost = traf * (1.0 - acc);
-        if (level[i] == COORD_LEVELS - 1 || !ref_ok) {        // judge a core by its unthrottled behaviour
+        if (level[i] == COORD_LEVELS - 1 || !ref_ok || vp.v3) {  // v3: keep measuring while throttled (phases)
             cost_ewma[i] = ref_ok ? vp.alpha * cost + (1 - vp.alpha) * cost_ewma[i] : cost;
             traf_ewma[i] = ref_ok ? vp.alpha * traf + (1 - vp.alpha) * traf_ewma[i] : traf;
             if (use + unu > 0)
@@ -617,6 +659,7 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
             }
         }
         level_epochs[i][level[i]]++;
+        since_change[i]++;
         if (vp.ways)
             quota_epochs[i] += cur_q[i];
     }
@@ -701,15 +744,22 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
         std::printf("COORD_W e=%llu revert score=%.4f gainer=%d\n", (unsigned long long)epoch_index, score, g);
         return;
     }
+    if (in_trial && skip_left) {                       // v3: let the transient after the change pass unscored
+        skip_left--;
+        trial_left--;
+        return;
+    }
     if (in_trial) {
-        double inv = 0.0, wsum = 0.0;
+        double inv = 0.0, wsum = 0.0, amsum = 0.0;
         for (uint32_t i = 0; i < NUM_CPUS; i++) {
             const double r = ref_ipc[i] > 0 ? ipc[i] / ref_ipc[i] : 1.0;
             const double w = vp.part ? 1.0 + ways[i] / avgw : 1.0;   // cores UCP protects count more
             inv += vp.score_am ? w * r : w / (r > 1e-3 ? r : 1e-3);
             wsum += w;
+            amsum += r;
         }
         trial_score += vp.score_am ? inv / wsum : wsum / inv;  // (weighted) harmonic mean (fairness) or arithmetic
+        trial_am += amsum / NUM_CPUS;                          // plain mean IPC ratio = throughput
         trial_self += ref_ipc[trial_core] > 0 ? ipc[trial_core] / ref_ipc[trial_core] : 1.0;
         for (uint32_t i = 0; i < NUM_CPUS; i++)
             trial_rsum[i] += ref_ipc[i] > 0 ? ipc[i] / ref_ipc[i] : 1.0;
@@ -720,6 +770,26 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
         bool ok = trial_dir < 0 ? score >= 1.0 + vp.gain
                                  : score >= 1.0 + (vp.upgain > -0.5 ? vp.upgain : -vp.gain / 2);
         const int j = trial_core;
+        if (vp.v3) {
+            // v3 acceptance.  DOWN (throttle): fairness must improve (score), throughput may not drop by more than
+            // am_tol, and the throttled core itself may not lose more than self_tol -- i.e. only prefetching that
+            // does not pay for itself is removed (self-harm / pure pollution) -- unless throughput rises by at least
+            // am_win (a bandwidth hog whose small loss buys a clearly larger gain for its neighbours).  UP (give prefetching back): kept
+            // unless it costs throughput -- prefetching is the default, throttling must keep proving itself.
+            const double am = trial_am / trial_n;
+            if (trial_dir < 0) {
+                if (ok && am < 1.0 - vp.am_tol) {
+                    ok = false;
+                    n_am_rej++;
+                }
+                if (ok && self < 1.0 - vp.self_tol && am < 1.0 + vp.am_win) {
+                    ok = false;
+                    n_self_rej++;
+                }
+            } else {
+                ok = am >= 1.0 - vp.am_tol;
+            }
+        }
         if (ok && trial_dir < 0 && !guard_ok(j)) {             // v2.2 victim guard (down trials only)
             ok = false;
             n_guard++;
@@ -757,8 +827,17 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
             return;
         }
         update_gate();
-        for (uint32_t i = 0; i < NUM_CPUS; i++)               // new reference = behaviour with the decision applied
-            ref_ipc[i] = ipc[i];
+        since_change[j] = 0;
+        if (vp.v3) {                                           // v3.1: back off revalidations that keep failing
+            const uint32_t cur = retest_int[j] ? retest_int[j] : vp.retest;
+            retest_int[j] = (!ok && trial_dir > 0) ? (cur * 2 < vp.retest_max ? cur * 2 : vp.retest_max) : vp.retest;
+        }
+        for (uint32_t i = 0; i < NUM_CPUS; i++) {             // new reference = behaviour with the decision applied
+            if (!vp.v3)
+                ref_ipc[i] = ipc[i];
+            else if (ok && trial_n)                            // v3: mean over the scored trial epochs (less noise);
+                ref_ipc[i] *= trial_rsum[i] / trial_n;         //     after a revert the old reference stays valid
+        }
         return;
     }
     for (uint32_t i = 0; i < NUM_CPUS; i++) {
@@ -782,6 +861,41 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
         if (ways_step(bwavg))
             return;
     }
+    if (vp.v3) {
+        // v3.1 periodic re-justification of every throttle.  (1) DRAM calm for COORD_V_CALM epochs: the reason for
+        // throttling is gone -> every throttled core gets one level back now (no trial needed: prefetching is the
+        // default).  (2) A core throttled for COORD_V_RETEST epochs gets an up-trial (kept unless it costs
+        // throughput), before any new throttle is tried -- each throttle has to keep proving itself.  A rejected
+        // revalidation doubles that core's interval (up to COORD_V_RETESTMAX); any kept change resets it.
+        if (calm_epochs >= vp.calm) {
+            bool any = false;
+            for (uint32_t i = 0; i < NUM_CPUS; i++)
+                if (level[i] < COORD_LEVELS - 1) {
+                    level[i]++;
+                    since_change[i] = 0;
+                    retest_int[i] = vp.retest;
+                    n_release++;
+                    any = true;
+                }
+            if (any) {
+                update_gate();
+                std::printf("COORD_V e=%llu release one level (DRAM calm for %u epochs)\n",
+                            (unsigned long long)epoch_index, calm_epochs);
+                return;
+            }
+        }
+        int r = -1;
+        for (uint32_t i = 0; i < NUM_CPUS; i++)
+            if (level[i] < COORD_LEVELS - 1 && since_change[i] >= (retest_int[i] ? retest_int[i] : vp.retest) &&
+                !cooldown_left[i] &&
+                (r < 0 || since_change[i] > since_change[r]))
+                r = (int)i;
+        if (r >= 0) {
+            n_revalid++;
+            start_trial(r, +1, "revalidate", bwavg);
+            return;
+        }
+    }
     if (bwavg >= vp.bw_hi) {
         // Pressure: two kinds of suspects, tried in turn -- (a) self-harm: most USELESS prefetch DRAM traffic
         // (inaccurate prefetchers, e.g. IPCP on irregular cache-sensitive code); (b) neighbour harm: most prefetch
@@ -797,7 +911,7 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
             int j = -1;
             for (uint32_t i = 0; i < NUM_CPUS; i++) {
                 total += m[i];
-                if (level[i] > 0 && !cooldown_left[i] && (j < 0 || m[i] > m[j]))
+                if (level[i] > 0 && !cooldown_left[i] && acc_ewma[i] < vp.protect && (j < 0 || m[i] > m[j]))
                     j = (int)i;
             }
             if (j >= 0 && total > 0 && m[j] >= vp.share * total / NUM_CPUS) {
@@ -812,7 +926,7 @@ void victim_step(const Snap &n, const Snap &o, double bwavg)
         }
     }
     int up = -1;                                               // calm, or time to re-test: give one level back
-    if (calm_epochs >= vp.calm || since_retest >= vp.retest)
+    if (!vp.v3 && (calm_epochs >= vp.calm || since_retest >= vp.retest))
         for (uint32_t i = 0; i < NUM_CPUS; i++)
             if (level[i] < COORD_LEVELS - 1 && !cooldown_left[i] && (up < 0 || acc_ewma[i] > acc_ewma[up]))
                 up = (int)i;
@@ -932,8 +1046,17 @@ void coord_init()
         num("COORD_V_DROP2", vp.drop2);
         if (const char *e = std::getenv("COORD_V_POLL"))
             vp.poll = *e == '1';
-        if (vp.ways > 4)
-            die("COORD_V_WAYS must be 0..4");
+        if (const char *e = std::getenv("COORD_V_V3"))
+            vp.v3 = *e == '1';
+        num("COORD_V_AMTOL", vp.am_tol);
+        num("COORD_V_SELFTOL", vp.self_tol);
+        num("COORD_V_AMWIN", vp.am_win);
+        num("COORD_V_PSRFULL", vp.psr_full);
+        cnt("COORD_V_RETESTMAX", vp.retest_max);
+        num("COORD_V_PROTECT", vp.protect);
+        cnt("COORD_V_SKIP", vp.skip);
+        if (vp.ways > 5)
+            die("COORD_V_WAYS must be 0..5");
         if (vp.ways && (!ucp_umon_hits || !ucp_umon_decay || !ucp_set_quota || !ucp_set_external_control))
             die("COORD_V_WAYS needs the ucp LLC replacement policy");
         if (vp.snap && !vp.ways)
@@ -1011,11 +1134,14 @@ void coord_arm()
         std::printf("[COORD] v2.1: fix=%d wmin=%u psr_hi=%.2f psr_lo=%.2f grants=%.2f/%.2f donor=%.2f\n", (int)vp.fix,
                     vp.wmin, vp.psr_hi, vp.psr_lo, vp.grant_hi, vp.grant_mid, vp.donor_frac);
     if (policy == POLICY_VICTIM)
+        std::printf("[COORD] v3: on=%d am_tol=%.4f self_tol=%.4f protect=%.2f skip=%u\n", (int)vp.v3, vp.am_tol, vp.self_tol,
+                    vp.protect, vp.skip);
+    if (policy == POLICY_VICTIM)
         std::printf("[COORD] v2.2: wtrig=%u wstep=%u gamma=%.2f guard=%.3f drop2=%.2f poll=%d\n", vp.wtrig, vp.wstep,
                     vp.gamma, vp.guard, vp.drop2, (int)vp.poll);
     if (policy == POLICY_VICTIM && vp.ways)
         std::printf("[COORD] ways: mode=%u (%s) snap=%d period=%u trial=%u cool=%u tol=%.4f acc_lo=%.2f\n", vp.ways,
-                    vp.ways == 1 ? "accuracy-weighted utility" : vp.ways == 3 ? "PSR-guided" : vp.ways == 4 ? "reclaim (v2.2)" : "UCP utility", (int)vp.snap, vp.wperiod, vp.wtrial,
+                    vp.ways == 1 ? "accuracy-weighted utility" : vp.ways == 3 ? "PSR-guided" : vp.ways == 4 ? "reclaim (v2.2)" : vp.ways == 5 ? "PSR-weighted, direct (v3)" : "UCP utility", (int)vp.snap, vp.wperiod, vp.wtrial,
                     vp.wcool, vp.wtol > -5 ? vp.wtol : vp.gain, vp.acc_lo);
 }
 
@@ -1031,12 +1157,37 @@ void coord_tick()
     next_epoch += epoch_cycles;
 }
 
-bool coord_pf_allow(uint32_t cpu, uint8_t cache_type)
+bool coord_pf_allow(uint32_t cpu, uint8_t cache_type, uint64_t base_addr)
 {
     // only the private L1D / L2C prefetchers are throttled; level COORD_LEVELS-1 (native) never drops anything
     if (cpu >= NUM_CPUS || (cache_type != IS_L1D && cache_type != IS_L2C))
         return true;
     static const uint8_t quarters[COORD_LEVELS] = {0, 1, 2, 4};  // allowed requests per 4 attempts
+    if (vp.v3) {
+        // v3.1 (prefetcher-agnostic; no prefetcher code is changed): a "burst" = the requests one trigger issues (same cycle, same triggering address), nearest first.
+        // Keep the first floor(f x average burst size + carry) of each burst, f = allowed fraction of the level:
+        // a degree-d prefetcher becomes a degree-f*d prefetcher (the nearest, most timely lines survive), and
+        // single-request streams are thinned by the carried fraction.
+        Burst &b = burst[cpu][cache_type == IS_L1D ? 0 : 1];
+        const uint64_t cyc = current_core_cycle[cpu];
+        if (cyc != b.cyc || base_addr != b.base) {
+            if (b.cyc != ~0ULL)
+                b.avg = 0.875 * b.avg + 0.125 * b.idx;
+            b.cyc = cyc;
+            b.base = base_addr;
+            b.idx = 0;
+            const double budget = quarters[level[cpu]] / 4.0 * b.avg + b.carry;
+            b.allowed = (uint32_t)budget;
+            b.carry = budget - b.allowed;
+            if (b.carry > 1.0)
+                b.carry = 1.0;
+        }
+        const bool ok = quarters[level[cpu]] >= 4 || b.idx < b.allowed;
+        b.idx++;
+        if (!ok)
+            ++throttled[cpu];
+        return ok;
+    }
     const uint8_t n = quarters[level[cpu]];
     if (n >= 4)
         return true;
@@ -1060,10 +1211,14 @@ void coord_final_stats()
     if (policy != POLICY_VICTIM)
         return;
     std::printf("COORD_VSUM trials_down_kept=%llu trials_down=%llu trials_up_kept=%llu trials_up=%llu guard_rejects=%llu "
-                "drop2=%llu\n",
+                "drop2=%llu self_rejects=%llu throughput_rejects=%llu way_installs=%llu\n",
                 (unsigned long long)n_down_ok, (unsigned long long)(n_down_ok + n_down_rej),
                 (unsigned long long)n_up_ok, (unsigned long long)(n_up_ok + n_up_rej), (unsigned long long)n_guard,
-                (unsigned long long)n_drop2);
+                (unsigned long long)n_drop2, (unsigned long long)n_self_rej, (unsigned long long)n_am_rej,
+                (unsigned long long)n_ways_inst);
+    if (vp.v3)
+        std::printf("COORD_V3SUM calm_releases=%llu revalidations=%llu\n", (unsigned long long)n_release,
+                    (unsigned long long)n_revalid);
     for (uint32_t i = 0; i < NUM_CPUS; i++) {
         std::printf("Core_%u_coord_epochs_at_level", i);
         for (uint32_t l = 0; l < COORD_LEVELS; l++)

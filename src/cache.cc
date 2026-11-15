@@ -1473,7 +1473,7 @@ int CACHE::prefetch_line(uint64_t ip, uint64_t base_addr, uint64_t pf_addr, int 
     pf_requested++;
 
     // coordination controller: per-core prefetch throttle (never active unless COORD_POLICY needs it)
-    if (coord_gate_active && !coord_pf_allow(cpu, cache_type))
+    if (coord_gate_active && !coord_pf_allow(cpu, cache_type, base_addr))
         return 0;
 
     if (PQ.occupancy < PQ.SIZE)
@@ -1509,7 +1509,7 @@ int CACHE::prefetch_line(uint64_t ip, uint64_t base_addr, uint64_t pf_addr, int 
 
 int CACHE::kpc_prefetch_line(uint64_t base_addr, uint64_t pf_addr, int pf_fill_level, int delta, int depth, int signature, int confidence, uint32_t prefetch_metadata)
 {
-    if (coord_gate_active && !coord_pf_allow(cpu, cache_type))
+    if (coord_gate_active && !coord_pf_allow(cpu, cache_type, base_addr))
         return 0;
 
     if (PQ.occupancy < PQ.SIZE) {

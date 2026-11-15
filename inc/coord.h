@@ -76,6 +76,34 @@
 //           COORD_V_GUARD   victim guard: reject a down / way trial if any other core's IPC drops by more than this
 //           COORD_V_DROP2   a pressure throttle drops two levels at once if the core's accuracy is below this
 //           COORD_V_POLL=1  rank self-harm suspects also by the share of their LLC blocks that are unused prefetches
+//   v3 (all off by default) -- fixes found in the 22-mix / 20-mix evaluation of v2.x:
+//           COORD_V_V3=1    acceptance rules.  A throttle step is kept only if fairness improves (score >= 1 + GAIN),
+//                           throughput (mean IPC ratio) drops by at most COORD_V_AMTOL (0.005) and the throttled core
+//                           itself loses at most COORD_V_SELFTOL (0.01) -- unless throughput rises by >= COORD_V_AMWIN
+//                           (0.01).  Giving prefetching back is kept unless it costs throughput (> AMTOL).  Before, a
+//                           throttle only had to raise the fairness score, so accurate, useful prefetchers (Pythia
+//                           accuracy >= 0.6, IPCP 0.2-0.6) were throttled 50-80% of the time and lost 2-10%.
+//           COORD_V_PROTECT never start a throttle trial on a core whose prefetch accuracy is >= this (e.g. 0.75)
+//           COORD_V_SKIP    the first SKIP epochs after a change are not scored (transient: a throttled core's loss
+//                           shows up late, its neighbours' gain immediately)
+//           COORD_V_WAYS=5  partition = UCP's lookahead on demand hits + PSR x prefetch hits (PSR = accuracy x
+//                           timeliness), installed every COORD_V_WPERIOD epochs like UCP (no trial, no churn).
+//   v3.1 (with COORD_V_V3=1):
+//           - every throttle is re-justified periodically: DRAM calm for COORD_V_CALM epochs -> every throttled core
+//             gets one level back at once; a core throttled for its revalidation interval (COORD_V_RETEST, doubling
+//             after each rejected revalidation up to COORD_V_RETESTMAX, reset by any kept change) gets an up-trial,
+//             kept unless it costs throughput, and revalidations go before new throttle trials
+//           - accuracy / timeliness / traffic keep being measured while a core is throttled (only issued requests
+//             count: a dropped request is never filled, so it is neither useful, useless nor late)
+//           - prefetcher-agnostic gate at CACHE::prefetch_line: of the requests one trigger issues in a cycle (a
+//             "burst", issued nearest first by IPCP / Pythia / stride-type prefetchers) the FARTHEST are dropped:
+//             level 2 keeps the first half, level 1 the first quarter (avg burst size; single-request streams are
+//             thinned by a carried fraction), level 0 none -- a degree cut without touching the prefetcher
+//           - after a kept trial the reference IPC is the trial mean; after a reverted one the old reference stays
+//           - a direct partition install (WAYS=5) takes its epoch: no throttle trial starts on top of it
+//           COORD_V_PSRFULL prefetch hits count fully once PSR >= this (weight min(1, PSR/PSRFULL)).  Use 0.3: useful
+//                           IPCP prefetchers have accuracy 0.2-0.6 (PSR ~0.42) yet speed their core up 1.5x, while the
+//                           harmful ones sit at accuracy ~0.1 (PSR ~0.10); timeliness is ~0.9 for all.
 //
 // Environment:
 //   COORD_EPOCH_CYCLES  epoch length in uncore cycles (default 1000000)
@@ -100,7 +128,7 @@ void coord_arm();               // call once when warm-up finishes (after cache 
 void coord_tick();              // call every uncore cycle after uncore.cycle++ (guard with coord_armed)
 
 // Called from CACHE::prefetch_line() when coord_gate_active. Returns false if this request must be dropped.
-bool coord_pf_allow(uint32_t cpu, uint8_t cache_type);
+bool coord_pf_allow(uint32_t cpu, uint8_t cache_type, uint64_t base_addr);
 int  coord_level(uint32_t cpu); // current prefetch level of a core (for prefetcher adapters)
 void coord_final_stats();       // end-of-run summary (victim policy)
 
