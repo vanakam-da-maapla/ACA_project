@@ -3,11 +3,10 @@
 
 \begin{figure*}[!tp]
 \centering
-\resizebox{0.92\textwidth}{!}{\input{figures/controller}}
-\caption{Coordinator overview.  Every epoch it reads standard per-core prefetch counters, per-core IPC, how busy
-DRAM is and UCP's shadow-tag hits (split into demand and prefetch), and sets a throttle level per core (applied by a
-filter at the common prefetch issue point that drops the farthest requests first) and, every five epochs, the
-per-core LLC way quota.}
+\includegraphics[width=0.92\textwidth]{tsc_overview.png}
+\caption{TSC overview.  Once per epoch the coordinator reads per-core IPC, prefetch accuracy, timeliness and
+traffic, UCP's demand and prefetch hits and the DRAM busy level (blue), and sets a throttle level per core, applied by
+a prefetch filter that drops the farthest requests first, and the per-core LLC way quota (red).}
 \label{fig:controller}
 \end{figure*}
 
@@ -62,43 +61,96 @@ coordinator replaces UCP's own repartitioning.  We implemented them for UCP only
 
 \subsection{Prefetch control}
 
+\begin{figure*}[!tp]
+\centering
+\includegraphics[width=0.95\textwidth]{tsc_flowchart.png}
+\caption{TSC decision flow at the end of every epoch.  A running trial is evaluated in A; otherwise the first
+applicable action of B is taken.  Every path ends the decision for the epoch; a trial started in B is evaluated in A
+in the following epochs, and a finished trial returns control to B.}
+\label{fig:flow}
+\end{figure*}
+
 \begin{algorithm}[!tp]
-\caption{TSC decision at the end of every epoch.  Constants are listed in \cref{tab:params}.}
+\caption{TSC: decision at the end of every epoch.  The functions are in Algorithm~\ref{alg:funcs}, the constants in
+\cref{tab:params}.}
 \label{alg:epoch}
 \small
 \DontPrintSemicolon
 \SetKwProg{Fn}{Function}{}{end}
 \SetKwFunction{FEnd}{EndOfEpoch}\SetKwFunction{FTrial}{Trial}\SetKwFunction{FEval}{Evaluate}
-\KwIn{per core $i$: $\mathit{IPC}_i$, prefetch accuracy $a_i$, way quota $q_i$; DRAM busy level $B$}
+\SetKwFunction{FSel}{SelectCore}\SetKwFunction{FHeld}{Held}\SetKwFunction{FPart}{Repartition}
+\SetKwFunction{FProbe}{EndProbe}
+\KwIn{per core $i$: $\mathit{IPC}_i$, prefetch accuracy $a_i$ and success rate $\mathit{PSR}_i$, useless and
+  total prefetch traffic $U_i$, $P_i$, way quota $q_i$; DRAM busy level $B$}
 \KwOut{throttle level $\ell_i\in\{0,1,2,3\}$ and way quota $q_i$ of every core}
 \KwData{$\mathit{ref}_i$: reference IPC of core $i$ (its IPC before a change)}
 \BlankLine
 \Fn{\FEnd{}}{
-  \lIf(\tcp*[f]{measure, then keep or undo}){a trial is running}{\FEval{}; \Return}
-  \lIf(\tcp*[f]{PSR-weighted UCP}){every $E_q$ epochs}{repartition the LLC}
-  \lIf(\tcp*[f]{no pressure}){DRAM calm for $C$ epochs}{$\ell_i\gets\ell_i+1$ for every throttled $i$ with $a_i\ge a_{\mathit{hold}}$}
-  \lIf(\tcp*[f]{re-test}){throttled core $i$ is due}{\FTrial{$i$, $+1$}}
-  \If(\tcp*[f]{pressure}){$B\ge B_{hi}$}{
-    $j\gets$ core with most useless (or way-scaled total) prefetch traffic, $a_j<a_{\mathit{prot}}$\;
-    \FTrial{$j$, $-1$}\;
+  \lIf(\tcp*[f]{measure, keep or undo}){a trial is running}{\FEval{}; \Return}
+  \lIf(\tcp*[f]{PSR-weighted UCP}){every $E_q$ epochs}{\FPart{}}
+  \lIf(\tcp*[f]{held core probed}){a probe has ended}{\FProbe{}; \Return}
+  \If(\tcp*[f]{no pressure: give back}){DRAM calm for $C$ epochs}{
+    $\ell_i\gets\ell_i+1$ for every throttled $i$ with $\neg$\FHeld{$i$}; \Return
   }
+  \lIf(\tcp*[f]{probe}){a held core $i$ at level 0 is due}{$\ell_i\gets1$ for one epoch; \Return}
+  \lIf(\tcp*[f]{re-test}){a throttled core $i$ with $\neg$\FHeld{$i$} is due}{\FTrial{$i$, $+1$}; \Return}
+  \If(\tcp*[f]{pressure}){$B\ge B_{hi}$}{
+    $j\gets$\FSel{}\;
+    \lIf{$j\neq\bot$}{\FTrial{$j$, $-2$ \textbf{if} $a_j<a_2$ \textbf{else} $-1$}}
+  }
+}
+\end{algorithm}
+
+\begin{algorithm}[!tp]
+\caption{Functions of TSC.}
+\label{alg:funcs}
+\small
+\DontPrintSemicolon
+\SetKwProg{Fn}{Function}{}{end}
+\SetKwFunction{FTrial}{Trial}\SetKwFunction{FEval}{Evaluate}\SetKwFunction{FFilter}{Filter}
+\SetKwFunction{FSel}{SelectCore}\SetKwFunction{FHeld}{Held}\SetKwFunction{FPart}{Repartition}
+\SetKwFunction{FProbe}{EndProbe}
+\Fn(\tcp*[f]{on every prefetch burst of core $i$}){\FFilter{$i$, burst}}{
+  send the nearest share $f(\ell_i)$ of the burst; drop the rest \tcp*[r]{$f=0,\frac14,\frac12,1$}
+}
+\BlankLine
+\Fn{\FHeld{$i$}}{\Return $a_i<a_{\mathit{hold}}$ \tcp*[r]{no release trial, no calm release}}
+\BlankLine
+\Fn{\FSel{}}{
+  $x_i\gets U_i$, or (alternately) $x_i\gets P_i\cdot\bar q/q_i$ \tcp*[r]{useless / way-scaled traffic}
+  \Return $\arg\max x_i$ over cores with $\ell_i>0$, $a_i<a_{\mathit{prot}}$, not cooling down\;
+}
+\BlankLine
+\Fn{\FTrial{$j$, $\delta$}}{
+  $\ell_j\gets\ell_j+\delta$; skip 1 epoch, then measure $K$ epochs \tcp*[r]{then \FEval}
 }
 \BlankLine
 \Fn{\FEval{}}{
-  $r_i\gets\mathit{IPC}_i/\mathit{ref}_i$ for every core \tcp*[r]{after 1 skipped epoch, over $K$ epochs}
+  $r_i\gets\mathit{IPC}_i/\mathit{ref}_i$ for every core\;
   $F\gets$ way-weighted harmonic mean of $r_i$;\ $T\gets$ mean of $r_i$;\ $S\gets r_j$\;
-  \eIf(\tcp*[f]{throttle trial}){core $j$ was throttled}{
+  \eIf(\tcp*[f]{throttle trial}){$\delta<0$}{
     $\mathit{ok}\gets F\ge1+g\ \wedge\ T\ge1-\tau_T\ \wedge\ (S\ge1-\tau_S\ \vee\ T\ge1+\tau_W)$
-       $\wedge$ no other $r_i<1-\tau_V$\;
+      $\wedge$ no other $r_i<1-\tau_V$\;
   }(\tcp*[f]{release trial}){
     $\mathit{ok}\gets T\ge1-\tau_T\ \wedge\ S\ge1-\tau_S$\;
   }
   \lIf{$\mathit{ok}$}{$\mathit{ref}_i\gets$ IPC measured in the trial}
-  \lElse{undo the change of $\ell_j$}
+  \lElse{$\ell_j\gets\ell_j-\delta$; core $j$ cools down}
+}
+\BlankLine
+\Fn{\FProbe{}}{
+  $a\gets$ useful / filled prefetches of the probed core $i$ in the probe epoch\;
+  \lIf(\tcp*[f]{hold ends}){$a\ge a_{\mathit{hold}}$}{keep $\ell_i=1$}
+  \lElse{$\ell_i\gets0$}
+}
+\BlankLine
+\Fn{\FPart{}}{
+  $w_i\gets\min(1,\ \mathit{PSR}_i/\mathit{PSR}_{\mathit{full}})$\;
+  $q\gets$ UCP lookahead on demand hits $+\ w_i\cdot$ prefetch hits\;
 }
 \end{algorithm}
 
-Algorithm~\ref{alg:epoch} gives the decision logic.  Its design follows directly from the findings of
+\Cref{fig:flow} shows the decision flow, and Algorithms~\ref{alg:epoch} and~\ref{alg:funcs} give it as pseudocode.  Its design follows directly from the findings of
 \cref{sec:problem}.  The central mechanism is the \emph{trial}: the controller never decides from a model whether a
 change will help.  It makes one small change (one core, one level), measures its effect on every core for a few
 epochs, and keeps the change only if the measurement passes the acceptance test below; otherwise it restores the
