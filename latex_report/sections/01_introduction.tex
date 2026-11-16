@@ -1,0 +1,44 @@
+\section{Introduction}
+\label{sec:intro}
+
+Hardware data prefetching and shared last-level-cache (LLC) partitioning are two of the most effective techniques
+for hiding memory latency in multi-core processors.  On our 4-core mixes, the prefetchers IPCP~\cite{pakalapati2020ipcp} and Pythia~\cite{bera2021pythia} raise
+throughput by 37--40\% (\cref{tab:char4}), and utility-based cache partitioning (UCP)~\cite{qureshi2006ucp} divides
+the shared cache by the measured utility of each core.
+In a multi-core system both act on the same two shared resources, \emph{LLC capacity} and \emph{DRAM
+bandwidth}, but neither takes the other as input: the prefetchers do not see the partition, and UCP's utility
+monitors count prefetch hits without knowing whether the prefetched lines are used.
+
+We characterise how the two interact on 4 and 8 cores at two bandwidths per core (\cref{sec:problem}).  On 4 cores with
+ample bandwidth (9.6\,GB/s per core), no uniform setting of the two
+mechanisms beats running them independently, and a static oracle that jointly chooses per-core prefetch degrees and way allocations finds
+\OrcIpMean\% (IPCP) and \OrcPyMean\% (Pythia) of headroom.  On 8 cores at 2.4\,GB/s per core, however,
+36\% of the cores run more than 2\% \emph{slower than with neither mechanism} under IPCP+UCP, the worst core of a mix
+is slowed down 2.5$\times$ on average, and the oracle finds up to 38\% of headroom.  UCP changes the way allocation of only 17\% (IPCP) and 3\%
+(Pythia) of the cores when prefetching is enabled, and with IPCP the cores that gain ways have \emph{inaccurate}
+prefetchers (median accuracy 0.08, against 0.29 over all cores).
+
+Feedback-directed prefetch throttling has a long history~\cite{srinath2007fdp,ebrahimi2009hpac,ebrahimi2011prefetchaware}.
+Our first designs followed this approach, keeping a throttling step whenever a fairness metric improved, and also
+coordinated the way allocation.  Such a controller also throttles \emph{useful} prefetchers: in our measurements it
+kept the cores that prefetching speeds up by at least 1.3$\times$ throttled about 90\% of the time; these
+cores lost 11--16\%, and the prior-style designs lost up to 16\% on individual mixes.
+
+This paper makes the following contributions:
+\begin{itemize}
+  \item A characterisation of independent prefetching and LLC partitioning on 4- and 8-core systems with two
+        prefetchers, up to 50 class-balanced 4-core mixes and 20 8-core mixes, including a static oracle, a factorial study
+        of prefetching, partitioning and DRAM bandwidth, and a per-core root-cause analysis of why prior-style
+        throttling loses performance (\cref{sec:problem}).
+  \item TSC, a modular, epoch-based Throughput-Safe Coordinator (\cref{sec:method}).  It keeps a throttle step only
+        if the IPC measured after the step shows at most 0.5\% throughput loss and at most 1\% loss for the throttled core,
+        re-tests every throttle periodically, holds prefetchers with an accuracy below 0.15 down, and partitions the
+        LLC with a prefetch-success-rate-weighted utility.  It acts at the common prefetch issue point, dropping the
+        \emph{farthest} requests first, so IPCP and Pythia run unmodified; from UCP it needs split hit counters and an
+        interface to set the way quota.
+  \item An evaluation on 22 4-core mixes at two bandwidths and on 20 8-core mixes, with an ablation of the design
+        steps and a parameter sweep (\cref{sec:experiments}).  At 2.4\,GB/s per core the coordinator improves
+        throughput by 7.1\% over independent IPCP+UCP with a single mix below $-2\%$, compared with five such mixes
+        and losses of up to 16\% for prior-style designs, and it causes no regression with Pythia, where every
+        prior-style design loses throughput.
+\end{itemize}

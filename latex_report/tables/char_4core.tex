@@ -1,0 +1,10 @@
+\begin{tabular}{lrcccccc}
+\toprule
+ & & \multicolumn{2}{c}{Weighted speedup} & \multicolumn{2}{c}{Worst core} & DRAM reads & LLC miss lat. \\
+\cmidrule(lr){3-4}\cmidrule(lr){5-6}
+Prefetcher & Mixes & PF only & PF+UCP & PF only & PF+UCP & PF+UCP & PF+UCP \\
+\midrule
+Pythia & 50 & 1.393 & 1.401 & 1.003 & 1.025 & +34\% & +42\% \\
+IPCP & 20 & 1.367 & 1.376 & 0.916 & 0.939 & +57\% & +60\% \\
+\bottomrule
+\end{tabular}

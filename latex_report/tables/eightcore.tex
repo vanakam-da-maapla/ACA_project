@@ -1,0 +1,17 @@
+\begin{tabular}{llcccccc}
+\toprule
+& Design & Throughput & HS & Worst mix & Mixes $<-2\%$ & Casualties & Worst core \\
+\midrule
+\multicolumn{8}{l}{\emph{8-core, 2.4 GB/s/core, IPCP, 19 of 20 mixes (mix 05 pending)}} \\
+& FDT & +7.4\% & +3.2\% & -7.9\% & 2 & 53$\to$49 & 0.70$\to$0.88 \\
+& FDT+PSR & +3.6\% & +0.6\% & -13.8\% & 8 & 53$\to$57 & 0.70$\to$0.80 \\
+& FDT+Reclaim & +4.3\% & +1.3\% & -7.6\% & 7 & 53$\to$55 & 0.70$\to$0.79 \\
+& \textbf{TSC} & +6.0\% & +5.2\% & -1.2\% & 0 & 53$\to$48 & 0.70$\to$0.75 \\
+\midrule
+\multicolumn{8}{l}{\emph{8-core, 2.4 GB/s/core, Pythia, 19 of 20 mixes (mix 05 pending)}} \\
+& FDT & -2.2\% & -5.4\% & -15.7\% & 8 & 37$\to$41 & 0.79$\to$0.89 \\
+& FDT+PSR & -3.8\% & -5.8\% & -21.0\% & 9 & 37$\to$45 & 0.79$\to$0.82 \\
+& FDT+Reclaim & -3.1\% & -4.8\% & -12.8\% & 12 & 37$\to$41 & 0.79$\to$0.83 \\
+& \textbf{TSC} & +0.1\% & 0.0\% & -0.7\% & 0 & 37$\to$37 & 0.79$\to$0.79 \\
+\bottomrule
+\end{tabular}

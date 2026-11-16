@@ -1,0 +1,21 @@
+\appendix
+\section{Static Oracle: All Evaluated Configurations}
+\label{app:oracle}
+
+\Cref{fig:scatterpy,fig:scatter8} complete \cref{fig:scatter}: every fixed configuration the per-core oracle evaluated
+for UCP+Pythia on 4 cores and for UCP+IPCP on 8 cores at 2.4\,GB/s per core.
+
+\begin{figure*}[!htbp]
+\centering
+\includegraphics[width=0.9\textwidth]{oracle_scatter_pythia.pdf}
+\caption{Per-core static oracle, 4-core, 9.6\,GB/s/core, UCP+Pythia (axes and marks as in \cref{fig:scatter}).}
+\label{fig:scatterpy}
+\end{figure*}
+
+\begin{figure*}[!htbp]
+\centering
+\includegraphics[width=0.95\textwidth]{oracle_scatter_8core.pdf}
+\caption{Per-core static oracle, 8-core UCP+IPCP at 2.4\,GB/s/core, axes as in \cref{fig:scatter}.  Many
+configurations gain throughput, but the largest gains mostly lie to the left of the star: they sacrifice a core.}
+\label{fig:scatter8}
+\end{figure*}

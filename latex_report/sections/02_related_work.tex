@@ -1,0 +1,36 @@
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Shared-cache partitioning}
+UCP~\cite{qureshi2006ucp} samples a few LLC sets with per-core auxiliary tag directories (utility monitors, UMONs) and
+periodically allocates ways with a greedy lookahead algorithm that maximises the total number of hits.  UCP counts
+every access that reaches the LLC, including prefetch requests, so a prefetcher can raise its core's measured utility
+regardless of whether the prefetched lines are later used.  PACMan~\cite{wu2011pacman} makes the LLC
+\emph{replacement} policy prefetch-aware but does not partition.
+
+\paragraph{Prefetch throttling}
+Feedback-directed prefetching (FDP)~\cite{srinath2007fdp} adjusts a prefetcher's degree and distance from its
+accuracy, lateness and pollution.  Ebrahimi et al.~\cite{ebrahimi2009hpac} coordinate the prefetchers of several cores
+(HPAC): a core's prefetcher is throttled when it is inaccurate and interferes with the others, using global feedback on
+bandwidth and pollution.  The same group later made shared-resource management techniques prefetch-aware~\cite{
+ebrahimi2011prefetchaware}, and prefetch-aware DRAM controllers~\cite{lee2008padc} prioritise useful prefetches in the
+memory controller.  APAC~\cite{yang2025apac} replaces hand-written rules with a reinforcement-learning agent that sets
+prefetch aggressiveness from accuracy, timeliness, pollution and bandwidth feedback, and reports 6.73\% over FDP on
+multi-core systems in ChampSim.  These works control the prefetcher, but treat the cache allocation as given.
+
+\paragraph{Bandwidth-aware prefetching}
+Pythia~\cite{bera2021pythia} is an RL-based prefetcher whose reward includes the current DRAM bandwidth usage, so it
+prefetches less when bandwidth is scarce.  CLIP~\cite{panda2023clip} targets bandwidth-constrained many-core systems by prefetching according to load
+criticality.  Neither coordinates with the LLC partition.
+
+\paragraph{Joint management}
+CBP~\cite{holtryd2021cbp} manages cache partitioning, bandwidth partitioning and prefetch throttling together.  It
+tunes the three knobs in turn, each with its own controller, rather than taking one decision from a common view of
+both the prefetch and the partition state.  Prefetch-aware shared resource management~\cite{ebrahimi2011prefetchaware}
+adapts existing fairness mechanisms to prefetch requests, again without coupling the partition's utility to the
+quality of the prefetches.
+
+\paragraph{Gap}
+To our knowledge, no prior controller (i)~uses the quality of each core's prefetches to correct the partitioner's
+utility estimate, (ii)~uses the partition state to decide which prefetcher to throttle, and (iii)~undoes a throttling step when the IPC measured after it shows that it cost the throttled core or the
+system's throughput more than a small budget.

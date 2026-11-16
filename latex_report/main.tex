@@ -1,0 +1,83 @@
+% Coordinated prefetch throttling and LLC partitioning -- ACA course project report
+% Build: latexmk -pdf main.tex   (or pdflatex main; bibtex main; pdflatex main; pdflatex main)
+% Uses IEEEtran when available (e.g. Overleaf); falls back to a two-column article otherwise.
+\IfFileExists{IEEEtran.cls}{\documentclass[conference]{IEEEtran}}{\documentclass[10pt,twocolumn]{article}}
+
+\makeatletter
+\@ifclassloaded{IEEEtran}{}{%
+  \usepackage[margin=0.75in,columnsep=0.25in]{geometry}%
+}
+\makeatother
+
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit,calc,shapes.geometric,backgrounds}
+\usepackage[ruled,vlined,linesnumbered]{algorithm2e}
+\usepackage[hidelinks]{hyperref}
+\usepackage[capitalise,noabbrev]{cleveref}
+
+\graphicspath{{figures/}}
+% let LaTeX place floats near their text instead of deferring them to the end
+\renewcommand{\topfraction}{0.9}\renewcommand{\dbltopfraction}{0.9}
+\renewcommand{\bottomfraction}{0.6}\renewcommand{\textfraction}{0.07}
+\renewcommand{\floatpagefraction}{0.6}\renewcommand{\dblfloatpagefraction}{0.6}
+\setcounter{topnumber}{4}\setcounter{dbltopnumber}{3}\setcounter{totalnumber}{6}
+\makeatletter   % float-only pages: stack floats at the top instead of centring them with large gaps
+\setlength{\@fptop}{0pt}\setlength{\@fpsep}{14pt plus 2pt}\setlength{\@fpbot}{0pt plus 1fil}
+\setlength{\@dblfptop}{0pt}\setlength{\@dblfpsep}{14pt plus 2pt}\setlength{\@dblfpbot}{0pt plus 1fil}
+\makeatother
+\newcommand{\pending}[1]{\textcolor{red}{[\textbf{Pending:} #1]}}
+\newcommand{\vthree}{TSC}
+\InputIfFileExists{tables/oracle_numbers}{}{}   % oracle numbers quoted in Section 3 (scripts/make_figures.py)
+
+\title{Throughput-Safe Coordination of Prefetch Throttling and\\Shared-LLC Partitioning in Bandwidth-Constrained Multi-Cores}
+
+\author{%
+  \textit{ACA Course Project}\\
+  \pending{author names and affiliation}
+}
+
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Hardware prefetchers and shared last-level-cache (LLC) partitioning are designed and deployed independently, yet they
+compete for the same two resources: LLC capacity and DRAM bandwidth.  Using ChampSim with two state-of-the-art
+prefetchers (IPCP and Pythia) and Utility-based Cache Partitioning (UCP), we show that on 8 cores at 2.4\,GB/s per core, 36\% (IPCP) and 26\% (Pythia) of the cores run more than 2\% slower
+than with neither mechanism, that UCP changes the allocation of few cores when prefetching is enabled, and that with
+IPCP the cores that gain ways have inaccurate prefetchers.  A static oracle finds up to 38\% of headroom at 8 cores,
+against \OrcIpMean\% (IPCP) and \OrcPyMean\% (Pythia) on average on 4 cores with ample bandwidth.  Prior-style
+fairness-driven throttling keeps the cores that prefetching speeds up by at least 1.3$\times$ throttled about 90\% of
+the time and loses up to 16\% on individual mixes.  We present TSC, a modular, epoch-based Throughput-Safe
+Coordinator that (i)~applies each throttle step tentatively and keeps it only if the IPC measured in the following epochs shows at most
+0.5\% throughput loss and at most 1\% loss for the throttled core, cutting the \emph{farthest} requests first at the common prefetch issue point so that
+IPCP and Pythia run unmodified, (ii)~holds prefetchers with an accuracy below 0.15 down, re-checking them with short
+accuracy probes, and (iii)~partitions the LLC with a prefetch-success-rate-weighted utility.  On 22 class-balanced 4-core mixes at 2.4\,GB/s per
+core, TSC improves throughput by 7.1\% (harmonic speedup +6.4\%) over independent IPCP+UCP with a single
+mix below $-2\%$, versus 5 such mixes and up to $-16\%$ for the prior-style designs.  With Pythia, every prior-style design loses throughput (1.3--1.5\%) while TSC changes it by 0.0\% with no mix
+below $-2\%$.  On 8 cores at 2.4\,GB/s per core (19 of 20 mixes), TSC improves throughput by 6.0\% with IPCP and
+by 0.1\% with Pythia, with no mix below $-2\%$, while the prior-style designs have 2--12 such mixes.
+\end{abstract}
+
+\input{sections/01_introduction}
+\input{sections/02_related_work}
+\input{sections/03_problem}
+\input{sections/04_methodology}
+\input{sections/05_experiments}
+\input{sections/06_conclusion}
+
+\IfFileExists{IEEEtran.bst}{\bibliographystyle{IEEEtran}}{\bibliographystyle{plain}}
+\bibliography{refs}
+
+\input{sections/07_appendix}   % appendix after the references
+
+\end{document}

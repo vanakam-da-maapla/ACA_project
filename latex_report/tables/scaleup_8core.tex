@@ -1,0 +1,19 @@
+\begin{tabular}{llrcccc}
+\toprule
+DRAM & Configuration & PF & Thr. vs no-PF & Max slowdown & Fairness & Casualties \\
+\midrule
+2400 MT/s & No PF, no partitioning & -- & 1.000 & 2.02 & 0.57 & 0 \\
+2400 MT/s & UCP only & -- & 1.004 & 2.03 & 0.57 & 23 \\
+2400 MT/s & PF only (LRU) & IPCP & 1.220 & 2.05 & 0.42 & 45 \\
+2400 MT/s & PF only (LRU) & Pythia & 1.309 & 1.89 & 0.43 & 33 \\
+2400 MT/s & PF + UCP & IPCP & 1.221 & 2.11 & 0.41 & 47 \\
+2400 MT/s & PF + UCP & Pythia & 1.307 & 1.79 & 0.44 & 32 \\
+\midrule
+1200 MT/s & No PF, no partitioning & -- & 1.000 & 2.18 & 0.55 & 0 \\
+1200 MT/s & UCP only & -- & 1.003 & 2.20 & 0.55 & 25 \\
+1200 MT/s & PF only (LRU) & IPCP & 1.134 & 2.48 & 0.40 & 61 \\
+1200 MT/s & PF only (LRU) & Pythia & 1.234 & 2.27 & 0.41 & 42 \\
+1200 MT/s & PF + UCP & IPCP & 1.129 & 2.53 & 0.39 & 57 \\
+1200 MT/s & PF + UCP & Pythia & 1.231 & 2.14 & 0.43 & 41 \\
+\bottomrule
+\end{tabular}

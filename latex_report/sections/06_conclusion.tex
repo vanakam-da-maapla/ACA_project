@@ -1,0 +1,34 @@
+\section{Conclusion and Future Work}
+\label{sec:conclusion}
+
+On 8 cores at 2.4\,GB/s per core, independent prefetching and UCP leave 36\% (IPCP) and 26\% (Pythia) of the cores
+more than 2\% slower than with neither mechanism, UCP gives extra ways to cores with inaccurate IPCP prefetchers, and
+a static oracle finds up to 38\% of headroom.  Feedback throttling that keeps a step when fairness improves keeps the
+cores that prefetching speeds up by at least 1.3$\times$ throttled about 90\% of the time and loses up to 16\% on
+individual mixes.
+
+We presented TSC, a modular coordinator that keeps a throttle step only if the IPC measured after it shows at most 0.5\%
+throughput loss and at most 1\% loss for the throttled core, re-tests every throttle, holds prefetchers with an
+accuracy below 0.15 down, and weights the partitioner's utility by each core's prefetch success rate.  It needs no
+change to IPCP or Pythia and about 84 bytes of state per core.  On 22 4-core mixes at 2.4\,GB/s per core it
+improves throughput by 7.1\% over independent IPCP+UCP with one mix below $-2\%$, against five such mixes and losses
+of up to 16\% for prior-style designs, changes Pythia's throughput by 0.0\% where every prior-style design loses 1.3--1.5\%, and changes throughput by
+$+0.6\%$ (IPCP) and $-0.2\%$ (Pythia) at 9.6\,GB/s per core.
+On 8 cores at 2.4\,GB/s per core (19 of 20 mixes) it improves throughput by 6.0\% (IPCP) and 0.1\% (Pythia) with no
+mix below $-2\%$; FDT gains more with IPCP (7.4\%) but has two such mixes, and every prior-style design loses
+2.2--3.8\% with Pythia.
+
+\paragraph{Future work}
+\begin{itemize}
+  \item Confine the accuracy hold to periods of DRAM pressure, and test prefetchers for self-harm also when DRAM is
+        calm, to reach the static headroom at ample bandwidth (\cref{sec:limits}).
+  \item Replace the hand-set acceptance thresholds with a learned policy, using the keep-or-revert trials as its
+        reward signal.  Online reinforcement learning already controls a single prefetcher
+        (Pythia~\cite{bera2021pythia}), the aggressiveness of the prefetchers of several cores
+        (APAC~\cite{yang2025apac}) and the joint use of several prefetchers and an off-chip predictor
+        (Athena~\cite{bera2026athena}); extending such an agent to the LLC partition is the natural next step.
+  \item Rescue victims of useful prefetching with DRAM bandwidth partitioning~\cite{holtryd2021cbp} rather than by
+        throttling, which the throughput budget forbids.
+  \item Lower-noise measurement, e.g.\ set dueling for the partition and longer, interleaved trials.
+  \item More prefetchers (SPP, Bingo, Berti) and core counts beyond 8.
+\end{itemize}
