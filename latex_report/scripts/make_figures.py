@@ -418,7 +418,7 @@ def grid_figure():
         for i, p in enumerate(PART):
             for j, d in enumerate(DEG):
                 v, n = M[i][j], per[(p, d)][2]
-                txt = "indep." if (p, d) == ("ucp", "native") else "%s\n%d mix%s" % (pct(1 + v / 100).replace("\\%", "%"), n, "" if n == 1 else "es")
+                txt = "indep." if (p, d) == ("ucp", "native") else "%s\n%d mix%s" % (("%+.2f%%" % v) if abs(v) < 0.1 else ("%+.1f%%" % v), n, "" if n == 1 else "es")
                 ax.text(j + 0.5, i + 0.5, txt.replace("\\n", "\n"), ha="center", va="center", fontsize=6,
                         color="white" if abs(v) > 8 else "black")
         ax.set_xticks([j + 0.5 for j in range(len(DEG))], [DEGL[d] for d in DEG])

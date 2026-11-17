@@ -14,7 +14,7 @@ ample bandwidth (9.6\,GB/s per core), no uniform setting of the two
 mechanisms beats running them independently, and a static oracle that jointly chooses per-core prefetch degrees and way allocations finds
 \OrcIpMean\% (IPCP) and \OrcPyMean\% (Pythia) of headroom.  On 8 cores at 2.4\,GB/s per core, however,
 36\% of the cores run more than 2\% \emph{slower than with neither mechanism} under IPCP+UCP, the worst core of a mix
-is slowed down 2.5$\times$ on average, and the oracle finds up to 38\% of headroom.  UCP changes the way allocation of only 17\% (IPCP) and 3\%
+runs 2.5$\times$ slower than alone on average (2.2$\times$ with neither mechanism), and the oracle finds up to 38\% of headroom.  UCP changes the way allocation of only 17\% (IPCP) and 3\%
 (Pythia) of the cores when prefetching is enabled, and with IPCP the cores that gain ways have \emph{inaccurate}
 prefetchers (median accuracy 0.08, against 0.29 over all cores).
 

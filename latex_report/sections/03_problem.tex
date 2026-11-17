@@ -76,7 +76,8 @@ the independent run (native prefetcher on every core, UCP partitioning):
 \includegraphics[width=0.92\textwidth]{grid_headroom.pdf}
 \caption{Uniform knobs, 4-core: throughput of every combination of a degree cap applied to all cores and a
 partitioning policy, relative to independent operation (UCP + native prefetcher, ``indep.''), geometric mean over
-the mixes, and the number of mixes in which the configuration gains at least 2\%.  No uniform configuration beats
+the mixes (first line), and the number of mixes in which the configuration gains at least 2\% (second line; ``0
+mixes'': it helps no mix by that much).  No uniform configuration beats
 independent operation on average.}
 \label{fig:grid}
 \end{figure*}
@@ -134,8 +135,8 @@ in the partition with Pythia.
 
 \begin{table}[!htbp]
 \centering
-\caption{8-core factorial study (20 mixes): throughput vs no prefetching and no partitioning, max slowdown,
-fairness, and casualty cores (of 160).}
+\caption{8-core factorial study (20 mixes): throughput vs no prefetching and no partitioning, max slowdown (largest
+slowdown of a core vs running alone), fairness (smallest over largest slowdown), and casualty cores (of 160).}
 \label{tab:scaleup}
 \footnotesize
 \resizebox{\columnwidth}{!}{\input{tables/scaleup_8core}}
@@ -153,7 +154,9 @@ core halves.}
 
 On 8 cores (\cref{tab:scaleup}, \cref{fig:casualties}), halving the per-core bandwidth from 4.8 to 2.4\,GB/s lowers
 the throughput gain of IPCP+UCP from 22\% to 13\% and raises the casualties from 47 to 57 of 160 cores (Pythia: 32 to
-41); with IPCP the worst core of a mix is slowed down 2.5$\times$ on average.  The per-core static oracle at 2.4\,GB/s per core
+41); with IPCP the most slowed-down core of a mix runs 2.5$\times$ slower than alone on average, against 2.2$\times$
+with neither mechanism, and the fairness (slowest over fastest core's slowdown) drops from 0.55 to 0.39 (Pythia
+0.43).  The per-core static oracle at 2.4\,GB/s per core
 finds a mean headroom of 14.9\% and a maximum of 38.2\% for IPCP, at least 3\% in 6 of 8 mixes (\cref{tab:oracle};
 every configuration in \cref{fig:scatter8}, appendix).  It comes almost entirely from the prefetch knob: at the
 search length, tuning only the degrees reaches 19.8\% on average, tuning only the partition 4.4\%, and the joint
