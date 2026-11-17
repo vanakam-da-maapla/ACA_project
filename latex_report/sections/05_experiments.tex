@@ -103,11 +103,22 @@ At 9.6\,GB/s per core \vthree{} changes throughput by +0.6\% (IPCP) and $-0.2\%$
 \label{fig:byclass}
 \end{figure*}
 
+\begin{figure*}[!tp]
+\centering
+\includegraphics[width=0.9\textwidth]{hs_permix_lowbw.pdf}
+\caption{4-core, 2.4\,GB/s/core: per-mix harmonic speedup (fairness) vs independent PF+UCP, mixes in the same order
+as \cref{fig:permix}.}
+\label{fig:hspermix}
+\end{figure*}
+
 \paragraph{Per mix and per class}
 \Cref{fig:permix} shows the per-mix results: on the mixes where the prior-style designs gain most (right) \vthree{}
 gains as well, and on the mixes where they lose (left) \vthree{} stays within 3\%.  By class (\cref{fig:byclass}), the cache-sensitive, prefetch-insensitive
 cores (HCLP) gain the most with IPCP (+17\%); unlike FDT, \vthree{} does not sacrifice the LCHP cores,
-whose prefetchers are useful ($-10\%$ under FDT, +4\% under \vthree).
+whose prefetchers are useful ($-10\%$ under FDT, +4\% under \vthree).  \Cref{fig:hspermix} shows the same mixes for fairness: \vthree{} raises the harmonic speedup by more than 2\% in 13
+of 22 IPCP mixes and lowers it by more than 2\% in one (worst $-3.0\%$), whereas the prior-style designs lower it by
+more than 2\% in 8--10 IPCP and 11--12 Pythia mixes (worst $-24.8\%$).  With Pythia, \vthree{} stays within 2\% of
+independent operation in every mix.
 
 \subsection{8-core results}
 
@@ -133,6 +144,33 @@ casualties (53 $\to$ 48, FDT 49), while FDT raises the mean worst core more (0.7
 \vthree{} changes throughput by $+0.1\%$ with no mix below $-2\%$ (worst $-0.7\%$) and leaves the casualties
 unchanged (37).  Every prior-style design loses throughput (2.2--3.8\%), has 8--12 mixes below $-2\%$ (worst
 $-21.0\%$) and raises the casualties to 41--45.
+
+\begin{figure*}[!tp]
+\centering
+\includegraphics[width=0.9\textwidth]{permix_8core.pdf}
+\caption{8-core, 2.4\,GB/s/core: per-mix throughput vs independent PF+UCP, sorted by \vthree{}, on the mixes for
+which every design has finished.  Dashed line: $-2\%$.}
+\label{fig:permix8}
+\end{figure*}
+
+\begin{figure*}[!tp]
+\centering
+\includegraphics[width=0.9\textwidth]{byclass_8core_designs.pdf}
+\caption{8-core, 2.4\,GB/s/core: per-core speedup over independent PF+UCP by workload class, on the same mixes as
+\cref{fig:permix8}.}
+\label{fig:byclass8}
+\end{figure*}
+
+\begin{figure*}[!tp]
+\centering
+\includegraphics[width=0.9\textwidth]{hs_permix_8core.pdf}
+\caption{8-core, 2.4\,GB/s/core: per-mix harmonic speedup (fairness) vs independent PF+UCP, mixes in the same order as
+\cref{fig:permix8}.}
+\label{fig:hspermix8}
+\end{figure*}
+
+\Cref{fig:permix8,fig:hspermix8,fig:byclass8} show the 8-core results per mix (throughput and fairness) and per
+workload class.
 
 \subsection{Sensitivity}
 \label{sec:sweep}

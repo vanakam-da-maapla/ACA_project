@@ -754,6 +754,41 @@ def oracle_tables():
     write("oracle_8core_mixes.tex", "\n".join(t) + "\n")
 
 
+# ------------------------------------------------------------------ per-mix fairness (harmonic speedup), 4 and 8 cores
+def hs_permix_figure(rows, setup, vs, fname, title):
+    """Per-mix harmonic speedup vs independent, mixes in the same order as the throughput figure (sorted by TSC
+    throughput) so the two can be read side by side."""
+    fig, axes = plt.subplots(2, 1, figsize=(7.0, 3.6))
+    for ax, p in zip(axes, ("ipcp", "pythia")):
+        M = matched(rows, setup, p, need=tuple(vs))
+        key = "v33" if "v33" in vs else vs[0]
+        mixes = sorted(M, key=lambda m: M[m][key]["NWS_vs_independent"])
+        w = 0.8 / len(vs)
+        for k, v in enumerate(vs):
+            ax.bar([i + (k - (len(vs) - 1) / 2) * w for i in range(len(mixes))],
+                   [100 * (M[m][v]["HS_vs_independent"] - 1) for m in mixes], w, color=COL[v],
+                   label=NAME[v].replace("\\textbf{", "").replace("}", ""))
+        ax.axhline(0, color="black", lw=0.5)
+        ax.set_xticks(range(len(mixes)))
+        ax.set_xticklabels(["%d" % m for m in mixes])
+        ax.set_ylabel("Harmonic speedup\nvs indep. (%)")
+        ax.set_title("%s, %s: per-mix fairness (%d mixes, same order as throughput)" % (PNAME[p], title, len(mixes)))
+        if p == "ipcp":
+            ax.legend(frameon=False, ncol=len(vs), loc="upper left")
+    axes[-1].set_xlabel("Mix id")
+    fig.tight_layout()
+    fig.savefig(FIG / fname)
+    plt.close(fig)
+    print("wrote figures/%s (%s)" % (fname, ", ".join(vs)))
+
+
+def fairness_figures():
+    hs_permix_figure(sheet(D / "final_4core.xlsx", "Per mix"), "4core_lowbw", ("vpt_part", "psr", "v22", "v33"),
+                     "hs_permix_lowbw.pdf", "4-core, 2.4 GB/s/core")
+    rows = rows8("Per mix")
+    hs_permix_figure(rows, "8core", designs8(rows), "hs_permix_8core.pdf", "8-core, 2.4 GB/s/core")
+
+
 if __name__ == "__main__":
     char_table()
     scaleup_table()
@@ -767,6 +802,7 @@ if __name__ == "__main__":
     eightcore_table()
     permix_8core_figure()
     byclass_8core_figure()
+    fairness_figures()
     grid_figure()
     oracle_figure()
     oracle_scatter_figures()
