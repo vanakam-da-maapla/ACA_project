@@ -614,6 +614,146 @@ def oracle_figure():
     plt.close(fig)
     print("wrote figures/oracle_knobs.pdf")
 
+# ------------------------------------------------------------------ 8-core per-mix and per-class figures
+def rows8(tab):
+    """8-core rows of FDT, FDT+PSR, FDT+Reclaim (v22_8core.xlsx) and TSC (v33_8core.xlsx, if present)."""
+    rows = [r for r in sheet(D / "v22_8core.xlsx", tab) if r["setup"] == "8core"]
+    if (D / "v33_8core.xlsx").is_file():
+        rows += [r for r in sheet(D / "v33_8core.xlsx", tab) if r["setup"] == "8core" and r["variant"] == "v33"]
+    return rows
+
+
+def designs8(rows):
+    return [v for v in ("vpt_part", "psr", "v22", "v33") if any(r["variant"] == v for r in rows)]
+
+
+def permix_8core_figure():
+    rows = rows8("Per mix")
+    vs = designs8(rows)
+    fig, axes = plt.subplots(2, 1, figsize=(7.0, 3.6))
+    for ax, p in zip(axes, ("ipcp", "pythia")):
+        M = matched(rows, "8core", p, need=tuple(vs))
+        key = "v33" if "v33" in vs else vs[0]
+        mixes = sorted(M, key=lambda m: M[m][key]["NWS_vs_independent"])
+        w = 0.8 / len(vs)
+        for k, v in enumerate(vs):
+            ax.bar([i + (k - (len(vs) - 1) / 2) * w for i in range(len(mixes))],
+                   [100 * (M[m][v]["NWS_vs_independent"] - 1) for m in mixes], w, color=COL[v],
+                   label=NAME[v].replace("\\textbf{", "").replace("}", ""))
+        ax.axhline(0, color="black", lw=0.5)
+        ax.axhline(-2, color="#d94801", lw=0.5, ls="--")
+        ax.set_xticks(range(len(mixes)))
+        ax.set_xticklabels(["%d" % m for m in mixes])
+        ax.set_ylabel("Throughput vs indep. (%)")
+        ax.set_title("%s, 8-core, 2.4 GB/s/core: per mix (%d mixes, sorted by %s)" % (
+            PNAME[p], len(mixes), "TSC" if key == "v33" else "FDT"))
+        if p == "ipcp":
+            ax.legend(frameon=False, ncol=len(vs), loc="upper left")
+    axes[-1].set_xlabel("Mix id")
+    fig.tight_layout()
+    fig.savefig(FIG / "permix_8core.pdf")
+    plt.close(fig)
+    print("wrote figures/permix_8core.pdf (%s)" % ", ".join(vs))
+
+
+def byclass_8core_figure():
+    mixrows = rows8("Per mix")
+    vs = designs8(mixrows)
+    cores = rows8("Per core")
+    classes = ("HCHP", "HCLP", "LCHP", "LCLP")
+    fig, axes = plt.subplots(1, 2, figsize=(7.0, 2.2))
+    for ax, p in zip(axes, ("ipcp", "pythia")):
+        mixes = set(matched(mixrows, "8core", p, need=tuple(vs)))     # same mixes for every design
+        w = 0.8 / len(vs)
+        for k, v in enumerate(vs):
+            vals = []
+            for c in classes:
+                x = [r["speedup_vs_independent"] for r in cores if r["prefetcher"] == p and r["variant"] == v
+                     and r["core_class"] == c and r["mix"] in mixes and r["speedup_vs_independent"]]
+                vals.append(100 * (gm(x) - 1) if x else 0)
+            ax.bar([i + (k - (len(vs) - 1) / 2) * w for i in range(len(classes))], vals, w, color=COL[v],
+                   label=NAME[v].replace("\\textbf{", "").replace("}", ""))
+        ax.axhline(0, color="black", lw=0.5)
+        ax.set_xticks(range(len(classes)))
+        ax.set_xticklabels(classes)
+        ax.set_title("%s, 8-core, 2.4 GB/s/core: per-core speedup by class" % PNAME[p])
+        ax.set_ylabel("Core speedup vs indep. (%)")
+        if p == "ipcp":
+            ax.legend(frameon=False, fontsize=6)
+    fig.tight_layout()
+    fig.savefig(FIG / "byclass_8core_designs.pdf")
+    plt.close(fig)
+    print("wrote figures/byclass_8core_designs.pdf (%s)" % ", ".join(vs))
+
+
+# ------------------------------------------------------------------ Appendix tables: per-mix static oracle (4 and 8 cores)
+def cfg_str(c):
+    """'w1-1-1-13_d6-6-6-0' -> 'ways 1/1/1/13; c3 off'  ('wucp' = UCP's adaptive ways, degree 6 = native, 0 = off)."""
+    if not c:
+        return "--"
+    w, d = c.split("_d") if "_d" in c else (c, "")
+    ways = "UCP" if w == "wucp" else "ways " + w[1:].replace("-", "/")
+    caps = [int(x) for x in d.split("-")] if d else []
+    off = [i for i, x in enumerate(caps) if x != 6]
+    if not off:
+        deg = ""
+    elif len(off) == len(caps) and len(set(caps)) == 1:
+        deg = "all off" if caps[0] == 0 else "all cap %d" % caps[0]
+    else:
+        deg = ", ".join("c%d %s" % (i, "off" if caps[i] == 0 else "cap %d" % caps[i]) for i in off)
+    return ways + ("; " + deg if deg else "")
+
+
+def oracle_tables():
+    R = list(openpyxl.load_workbook(D / "oracle_4core.xlsx", read_only=True, data_only=True)["Summary"]
+             .iter_rows(values_only=True))
+    hi = next(i for i, r in enumerate(R) if r and r[0] == "prefetcher" and "best config (throughput)" in r)
+    fin = {(r[0], int(r[1])): r for r in R[hi + 1:] if r and r[0] in ("ipcp", "pythia") and isinstance(r[1], (int, float))}
+    K = knob_rows()
+    f3 = lambda x: "%.3f" % float(x) if x is not None else "--"
+    t = ["\\begin{tabular}{llccclcclcc}", "\\toprule",
+         " & & \\multicolumn{3}{c}{Search length: best of} & \\multicolumn{3}{c}{Best validated (throughput)} & "
+         "\\multicolumn{3}{c}{Fairest validated, no throughput loss} \\\\",
+         "\\cmidrule(lr){3-5}\\cmidrule(lr){6-8}\\cmidrule(lr){9-11}",
+         "PF & Mix & PF knob & Partition & Both & Configuration & Thr. & Worst & Configuration & Thr. & Worst \\\\",
+         "\\midrule"]
+    for pf in ("ipcp", "pythia"):
+        for m, v, _ in K[pf]:
+            r = fin.get((pf, m))
+            t.append("%s & %d & %s & %s & %s & %s & %s & %s & %s & %s & %s \\\\" % (
+                PNAME[pf], m, f3(v["pf"]), f3(v["part"]), f3(v["both"]),
+                cfg_str(r[3]) if r else "not validated", f3(r[4]) if r else "--", f3(r[5]) if r else "--",
+                cfg_str(r[6]) if r else "--", f3(r[7]) if r else "--", f3(r[8]) if r else "--"))
+        t.append("\\midrule")
+    t[-1] = "\\bottomrule"
+    t.append("\\end{tabular}")
+    write("oracle_4core_mixes.tex", "\n".join(t) + "\n")
+
+    R8 = list(openpyxl.load_workbook(D / "scaleup_8core.xlsx", read_only=True, data_only=True)["Oracle"]
+              .iter_rows(values_only=True))
+    rows = [r for r in R8 if r and r[0] == "ipcp" and isinstance(r[1], int) and isinstance(r[3], str)]
+    summ = next(r for r in R8 if r and r[0] == "ipcp" and isinstance(r[1], int) and isinstance(r[2], (int, float)))
+    R8r = list(openpyxl.load_workbook(D / "scaleup_8core.xlsx", read_only=True, data_only=True)["Oracle runs"]
+               .iter_rows(values_only=True))
+    h = R8r[0]
+    runs = [dict(zip(h, r)) for r in R8r[1:] if r and r[0] == "ipcp"]
+    n = collections.Counter(r["kind"] for r in runs if r["phase"] == "search")
+    t = ["\\begin{tabular}{rlccclcc}", "\\toprule",
+         " & \\multicolumn{4}{c}{Best validated (throughput)} & \\multicolumn{3}{c}{Fairest validated, no throughput loss} \\\\",
+         "\\cmidrule(lr){2-5}\\cmidrule(lr){6-8}",
+         "Mix & Configuration & Knob & Thr. & Worst & Configuration & Thr. & Worst \\\\", "\\midrule"]
+    for r in rows:
+        t.append("%d & %s & %s & %.3f & %.3f & %s & %.3f & %.3f \\\\" % (
+            r[1], cfg_str(r[3]), r[4], float(r[5]), float(r[6]), cfg_str(r[8]), float(r[9]), float(r[10])))
+    t += ["\\midrule",
+          "\\multicolumn{8}{l}{Search length, mean of the best per mix: prefetch knob only %.3f, partition only %.3f, "
+          "both knobs %.3f} \\\\" % (float(summ[6]), float(summ[7]), float(summ[8])),
+          "\\multicolumn{8}{l}{Configurations evaluated in total over the %d mixes: prefetch only %d, partition only %d, "
+          "both knobs %d} \\\\" % (len(rows), n.get("prefetch only", 0), n.get("partition only", 0), n.get("both knobs", 0)),
+          "\\bottomrule", "\\end{tabular}"]
+    write("oracle_8core_mixes.tex", "\n".join(t) + "\n")
+
+
 if __name__ == "__main__":
     char_table()
     scaleup_table()
@@ -625,6 +765,9 @@ if __name__ == "__main__":
     byclass_figure()
     sweep_table()
     eightcore_table()
+    permix_8core_figure()
+    byclass_8core_figure()
     grid_figure()
     oracle_figure()
     oracle_scatter_figures()
+    oracle_tables()

@@ -118,7 +118,7 @@ and neither.  Up and to the right of the star is better.}
 \label{fig:scatter}
 \end{figure*}
 \paragraph{Per-core decisions find headroom with IPCP, and need both knobs}
-Choosing a degree cap and a way allocation per core (\cref{tab:oracle}) finds \OrcIpMean\% (IPCP) and
+Choosing a degree cap and a way allocation per core (\cref{tab:oracle}; per mix in \cref{tab:oracle4mix}, appendix) finds \OrcIpMean\% (IPCP) and
 \OrcPyMean\% (Pythia) on average after validation, at most \OrcMax\%, and at least 3\% in \OrcIpThree{} of \OrcIpN{}
 IPCP mixes but only \OrcPyThree{} of \OrcPyN{} Pythia mixes.  \Cref{fig:scatter} (IPCP; Pythia in \cref{fig:scatterpy}, appendix) shows every configuration
 the search evaluated.  With Pythia, the best validated configuration is within 1.5\% of independent operation in
@@ -157,7 +157,8 @@ the throughput gain of IPCP+UCP from 22\% to 13\% and raises the casualties from
 finds a mean headroom of 14.9\% and a maximum of 38.2\% for IPCP, at least 3\% in 6 of 8 mixes (\cref{tab:oracle};
 every configuration in \cref{fig:scatter8}, appendix).  It comes almost entirely from the prefetch knob: at the
 search length, tuning only the degrees reaches 19.8\% on average, tuning only the partition 4.4\%, and the joint
-search, which evaluated only 16 configurations (against 144 and 88), $-2.4\%$.  In four of eight mixes the best
+search, which evaluated only 16 configurations in total over the 8 mixes (against 144 and 88), $-2.4\%$
+(\cref{tab:oracle8mix}, appendix).  In four of eight mixes (\cref{tab:oracle8mix}) the best
 fixed configuration turns IPCP off on every core, which costs the worst core up to 54\%; the fairest configuration
 that does not lose throughput throttles a single core in six of eight mixes and still gains 0.1--22\%.
 

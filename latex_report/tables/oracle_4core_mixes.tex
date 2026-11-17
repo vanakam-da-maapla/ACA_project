@@ -1,0 +1,37 @@
+\begin{tabular}{llccclcclcc}
+\toprule
+ & & \multicolumn{3}{c}{Search length: best of} & \multicolumn{3}{c}{Best validated (throughput)} & \multicolumn{3}{c}{Fairest validated, no throughput loss} \\
+\cmidrule(lr){3-5}\cmidrule(lr){6-8}\cmidrule(lr){9-11}
+PF & Mix & PF knob & Partition & Both & Configuration & Thr. & Worst & Configuration & Thr. & Worst \\
+\midrule
+IPCP & 1 & 1.002 & 1.016 & 1.012 & ways 6/1/2/7 & 0.999 & 0.989 & ways 6/1/2/7; c0 cap 4 & 0.999 & 0.991 \\
+IPCP & 3 & 1.159 & 1.001 & 1.111 & UCP; all off & 1.172 & 1.074 & UCP; all cap 1 & 1.165 & 1.079 \\
+IPCP & 5 & 1.041 & 1.022 & 1.054 & UCP; c1 cap 1 & 1.028 & 1.012 & ways 1/6/1/8; c1 cap 1 & 1.026 & 1.013 \\
+IPCP & 7 & 1.000 & 1.000 & 0.999 & UCP; c1 cap 2 & 1.000 & 1.000 & ways 1/5/7/3 & 1.000 & 1.000 \\
+IPCP & 9 & 1.119 & 1.042 & 1.019 & UCP; c0 off & 1.108 & 1.010 & UCP; c0 off & 1.108 & 1.010 \\
+IPCP & 12 & 1.036 & 1.002 & 1.054 & ways 1/1/1/13; c3 cap 1 & 1.072 & 1.012 & ways 3/1/1/11; c3 cap 1 & 1.051 & 1.013 \\
+IPCP & 13 & 1.030 & 0.952 & 1.012 & UCP; c0 cap 1, c2 cap 1 & 1.028 & 1.002 & UCP; c2 off & 1.024 & 1.002 \\
+IPCP & 16 & 1.055 & 1.018 & 1.047 & UCP; c0 cap 1, c2 cap 1 & 1.049 & 1.008 & UCP; c0 cap 1, c2 off & 1.049 & 1.010 \\
+IPCP & 17 & 1.006 & 1.042 & 1.047 & ways 4/1/1/10; c3 cap 2 & 1.006 & 0.998 & ways 4/1/1/10; c3 cap 2 & 1.006 & 0.998 \\
+IPCP & 19 & 1.016 & 1.008 & 1.019 & ways 4/4/4/4; c1 cap 4, c2 cap 4, c3 cap 4 & 1.007 & 0.994 & ways 6/5/1/4 & 1.002 & 1.000 \\
+IPCP & 24 & 1.079 & 1.022 & 0.932 & UCP; c0 off & 1.087 & 1.003 & UCP; c0 off & 1.087 & 1.003 \\
+IPCP & 28 & 1.078 & 1.067 & 1.100 & ways 1/1/5/9; c3 off & 1.057 & 1.013 & ways 1/1/5/9; c3 off & 1.057 & 1.013 \\
+IPCP & 33 & 1.017 & 1.008 & 0.969 & UCP; all cap 4 & 1.036 & 0.962 & UCP; c3 cap 2 & 1.010 & 1.000 \\
+IPCP & 49 & 1.003 & 1.024 & 1.025 & ways 1/1/1/13; c1 cap 2 & 0.991 & 0.890 & ways 1/1/1/13; c1 cap 2 & 0.991 & 0.890 \\
+\midrule
+Pythia & 1 & 0.993 & 1.018 & 1.014 & ways 2/1/1/12 & 1.006 & 0.956 & ways 2/1/1/12; c1 cap 4 & 1.003 & 0.957 \\
+Pythia & 3 & 0.994 & 1.000 & 0.886 & UCP; c1 off & 1.007 & 1.000 & UCP; c1 off & 1.007 & 1.000 \\
+Pythia & 5 & 1.001 & 1.013 & 1.012 & ways 1/7/1/7 & 1.004 & 0.997 & ways 1/7/1/7; c1 cap 1 & 1.000 & 1.000 \\
+Pythia & 7 & 1.000 & 1.000 & 0.999 & ways 1/3/11/1 & 1.000 & 1.000 & ways 1/7/7/1 & 1.000 & 1.000 \\
+Pythia & 9 & 1.018 & 1.024 & 1.028 & UCP; c1 cap 2 & 1.001 & 1.000 & UCP; c1 cap 2 & 1.001 & 1.000 \\
+Pythia & 12 & 1.017 & 1.018 & 1.032 & ways 1/2/1/12; c1 cap 4 & 1.054 & 0.999 & ways 1/2/1/12 & 1.023 & 1.000 \\
+Pythia & 13 & 1.000 & 0.993 & 0.938 & UCP; c0 cap 4 & 1.000 & 0.999 & UCP; c0 cap 4 & 1.000 & 0.999 \\
+Pythia & 16 & 1.003 & 1.015 & 1.016 & ways 6/8/1/1; c2 cap 2 & 1.008 & 0.971 & UCP; c2 cap 4 & 1.001 & 1.000 \\
+Pythia & 17 & 1.002 & 1.039 & 1.040 & ways 3/1/1/11; c1 cap 4 & 1.004 & 0.987 & ways 3/1/1/11; c1 cap 4 & 1.004 & 0.987 \\
+Pythia & 19 & 1.001 & 1.003 & 1.003 & ways 7/5/1/3; c2 cap 4 & 1.002 & 0.997 & ways 7/5/1/3 & 1.000 & 1.000 \\
+Pythia & 24 & 1.025 & 1.042 & 1.078 & ways 6/8/1/1; c0 off & 1.052 & 0.996 & UCP; c0 off & 1.019 & 1.004 \\
+Pythia & 28 & 1.011 & 1.025 & 1.035 & ways 3/1/1/11; c3 off & 1.014 & 0.996 & UCP; c3 off & 1.011 & 1.001 \\
+Pythia & 33 & 1.002 & 1.002 & 1.006 & ways 12/1/1/2; c3 cap 2 & 1.004 & 0.956 & UCP; c0 cap 4 & 1.001 & 0.993 \\
+Pythia & 49 & 1.003 & 1.020 & 1.020 & ways 1/1/1/13 & 1.000 & 0.930 & ways 1/1/1/13 & 1.000 & 0.930 \\
+\bottomrule
+\end{tabular}

@@ -3,7 +3,8 @@
 \label{app:oracle}
 
 \Cref{fig:scatterpy,fig:scatter8} complete \cref{fig:scatter}: every fixed configuration the per-core oracle evaluated
-for UCP+Pythia on 4 cores and for UCP+IPCP on 8 cores at 2.4\,GB/s per core.
+for UCP+Pythia on 4 cores and for UCP+IPCP on 8 cores at 2.4\,GB/s per core.  \Cref{tab:oracle4mix,tab:oracle8mix}
+list the per-mix results.
 
 \begin{figure*}[!htbp]
 \centering
@@ -19,3 +20,24 @@ for UCP+Pythia on 4 cores and for UCP+IPCP on 8 cores at 2.4\,GB/s per core.
 configurations gain throughput, but the largest gains mostly lie to the left of the star: they sacrifice a core.}
 \label{fig:scatter8}
 \end{figure*}
+
+\begin{table*}[!htbp]
+\centering
+\caption{Per-core static oracle, 4-core, 9.6\,GB/s/core: per mix, the best throughput found at the search length when
+searching only the prefetch knob, only the partition or both, and the best and the fairest configuration that does not
+lose throughput after validation at full length.  Throughput (Thr.) and worst core are relative to independent
+operation.  Configuration: ``UCP'' = UCP's adaptive ways, ``ways a/b/c/d'' = fixed ways per core; c$k$ = core $k$,
+``cap $d$'' = degree cap $d$, ``off'' = prefetcher off, unlisted cores native.}
+\label{tab:oracle4mix}
+\footnotesize
+\resizebox{\textwidth}{!}{\input{tables/oracle_4core_mixes}}
+\end{table*}
+
+\begin{table*}[!htbp]
+\centering
+\caption{Per-core static oracle, 8-core UCP+IPCP, 2.4\,GB/s/core: per mix, the best and the fairest configuration
+that does not lose throughput after validation (notation as in \cref{tab:oracle4mix}), and the search summary.}
+\label{tab:oracle8mix}
+\footnotesize
+\input{tables/oracle_8core_mixes}
+\end{table*}

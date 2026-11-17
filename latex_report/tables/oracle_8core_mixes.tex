@@ -1,0 +1,19 @@
+\begin{tabular}{rlccclcc}
+\toprule
+ & \multicolumn{4}{c}{Best validated (throughput)} & \multicolumn{3}{c}{Fairest validated, no throughput loss} \\
+\cmidrule(lr){2-5}\cmidrule(lr){6-8}
+Mix & Configuration & Knob & Thr. & Worst & Configuration & Thr. & Worst \\
+\midrule
+2 & UCP; all off & prefetch only & 1.350 & 0.810 & UCP; all cap 2 & 1.216 & 1.055 \\
+6 & UCP; all off & prefetch only & 1.137 & 0.461 & UCP; c1 off & 1.053 & 0.996 \\
+9 & UCP; all off & prefetch only & 1.382 & 0.783 & UCP; c1 off & 1.082 & 1.021 \\
+11 & UCP; c4 cap 2 & prefetch only & 1.001 & 0.975 & UCP; c4 cap 2 & 1.001 & 0.975 \\
+14 & ways 1/1/4/6/1/1/1/1 & partition only & 1.009 & 0.877 & ways 1/1/4/6/1/1/1/1 & 1.009 & 0.877 \\
+15 & UCP; c2 off & prefetch only & 1.089 & 0.753 & UCP; c6 off & 1.027 & 0.980 \\
+16 & UCP; all off & prefetch only & 1.186 & 0.546 & UCP; c1 off & 1.029 & 1.001 \\
+20 & UCP; all cap 2 & prefetch only & 1.041 & 0.772 & UCP; c7 cap 2 & 1.024 & 1.000 \\
+\midrule
+\multicolumn{8}{l}{Search length, mean of the best per mix: prefetch knob only 1.198, partition only 1.044, both knobs 0.976} \\
+\multicolumn{8}{l}{Configurations evaluated in total over the 8 mixes: prefetch only 144, partition only 88, both knobs 16} \\
+\bottomrule
+\end{tabular}
